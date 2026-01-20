@@ -125,6 +125,16 @@ var RemoteQueueClient = class {
       body: JSON.stringify(graphData)
     });
   }
+  async getConcepts() {
+    const response = await (0, import_obsidian.requestUrl)({
+      url: `${this.baseUrl}/api/queue/concepts`,
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${this.token}`
+      }
+    });
+    return response.json.concepts || [];
+  }
   async checkHealth() {
     try {
       const response = await (0, import_obsidian.requestUrl)({
@@ -225,6 +235,21 @@ var CoachQueueClient = class {
       return false;
     }
   }
+  async pushConcepts(athleteId, concepts) {
+    const response = await (0, import_obsidian.requestUrl)({
+      url: `${this.baseUrl}/api/queue/concepts/push`,
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${this.token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        athlete_id: athleteId,
+        concepts
+      })
+    });
+    return response.json;
+  }
 };
 var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
   constructor() {
@@ -302,6 +327,11 @@ var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
       editorCallback: (editor, view) => this.coachPushArticle(view)
     });
     this.addCommand({
+      id: "flipmode-coach-push-concepts",
+      name: "Coach: Push concepts to athlete",
+      callback: () => this.coachPushConcepts()
+    });
+    this.addCommand({
       id: "flipmode-coach-add-athlete",
       name: "Coach: Add athlete to roster",
       callback: () => this.coachAddAthlete()
@@ -334,6 +364,13 @@ var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
         await this.openAudioPlayer(view);
       }
     });
+    this.addCommand({
+      id: "flipmode-sync-from-coach",
+      name: "Sync from Coach (fetch completed research)",
+      callback: async () => {
+        await this.syncFromCoach();
+      }
+    });
     this.addSettingTab(new BJJFlipmodeSettingTab(this.app, this));
     this.registerEvent(
       this.app.workspace.on("editor-menu", (menu, editor, view) => {
@@ -352,6 +389,11 @@ var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
           menu.addItem((item) => {
             item.setTitle("Dive Deeper").setIcon("search").onClick(async () => {
               await this.diveDeeper(editor, view, selection);
+            });
+          });
+          menu.addItem((item) => {
+            item.setTitle("Explode to Concept Graph").setIcon("git-branch").onClick(async () => {
+              await this.explodeToConceptGraph(editor, view, selection);
             });
           });
         }
@@ -588,39 +630,108 @@ ${article}`;
     return match ? match[1].trim() : null;
   }
   async coachPushArticle(view) {
+    var _a;
+    console.log("[Flipmode] coachPushArticle called");
+    new import_obsidian.Notice("Starting push...");
     if (!this.coachClient) {
-      new import_obsidian.Notice("Coach mode not configured");
+      new import_obsidian.Notice("Coach mode not configured - check settings");
+      console.log("[Flipmode] coachClient is null, mode:", this.settings.mode, "token:", (_a = this.settings.coachToken) == null ? void 0 : _a.substring(0, 8));
       return;
     }
     const file = view.file;
-    if (!file)
-      return;
-    const cache = this.app.metadataCache.getFileCache(file);
-    const frontmatter = cache == null ? void 0 : cache.frontmatter;
-    if (!(frontmatter == null ? void 0 : frontmatter.job_id)) {
-      new import_obsidian.Notice("Not a query note (no job_id in frontmatter)");
+    if (!file) {
+      new import_obsidian.Notice("No file open");
+      console.log("[Flipmode] No file in view");
       return;
     }
-    const jobId = frontmatter.job_id;
     const content = await this.app.vault.read(file);
-    const articleMatch = content.match(/## Generated Article\n\n([\s\S]*?)$/);
-    const article = articleMatch ? articleMatch[1].trim() : "";
+    console.log("[Flipmode] Push article - file:", file.path);
+    let jobId = null;
+    let athleteName = null;
+    let sourceFile = null;
+    let fileType = null;
+    const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    if (fmMatch) {
+      const fmContent = fmMatch[1];
+      const typeMatch = fmContent.match(/type:\s*(.+)/);
+      const jobIdMatch = fmContent.match(/job_id:\s*(.+)/);
+      const athleteMatch = fmContent.match(/athlete_name:\s*(.+)/);
+      const sourceMatch = fmContent.match(/source_file:\s*"?\[\[([^\]]+)\]\]"?/);
+      if (typeMatch)
+        fileType = typeMatch[1].trim();
+      if (jobIdMatch)
+        jobId = jobIdMatch[1].trim();
+      if (athleteMatch)
+        athleteName = athleteMatch[1].trim();
+      if (sourceMatch)
+        sourceFile = sourceMatch[1].trim();
+    }
+    console.log("[Flipmode] File type:", fileType, "job_id:", jobId, "source_file:", sourceFile);
+    if (fileType === "training-review" && sourceFile && !jobId) {
+      console.log("[Flipmode] Training Review - looking up source query:", sourceFile);
+      const sourceFilePath = this.app.metadataCache.getFirstLinkpathDest(sourceFile, file.path);
+      if (sourceFilePath) {
+        const sourceContent = await this.app.vault.read(sourceFilePath);
+        const sourceFmMatch = sourceContent.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+        if (sourceFmMatch) {
+          const sourceFm = sourceFmMatch[1];
+          const sourceJobId = sourceFm.match(/job_id:\s*(.+)/);
+          const sourceAthlete = sourceFm.match(/athlete_name:\s*(.+)/);
+          if (sourceJobId)
+            jobId = sourceJobId[1].trim();
+          if (sourceAthlete)
+            athleteName = sourceAthlete[1].trim();
+          console.log("[Flipmode] Got from source - job_id:", jobId, "athlete:", athleteName);
+        }
+      } else {
+        console.log("[Flipmode] Could not find source file:", sourceFile);
+      }
+    }
+    if (!jobId) {
+      new import_obsidian.Notice("Cannot push: no job_id found (check source query link)");
+      return;
+    }
+    let article;
+    if (fileType === "training-review") {
+      const contentAfterFm = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
+      article = contentAfterFm.replace(/> \[!warning\][\s\S]*?(?=\n## |\n# )/g, "").replace(/## Listen to Review[\s\S]*?(?=\n## |\n# )/g, "").replace(/## Deep Dive[\s\S]*?(?=\n## |$)/g, "").replace(/## Links[\s\S]*$/g, "").trim();
+    } else {
+      const articleMatch = content.match(/## Generated Article\n\n([\s\S]*?)$/);
+      article = articleMatch ? articleMatch[1].trim() : "";
+    }
     if (!article || article.includes('Run "Coach: Generate article"')) {
       new import_obsidian.Notice("No article content to push");
       return;
     }
+    console.log("[Flipmode] Article length:", article.length);
     new import_obsidian.Notice("Pushing to athlete...");
     try {
+      try {
+        await this.coachClient.claimJob(jobId);
+        console.log("[Flipmode] Job claimed");
+      } catch (claimErr) {
+        console.log("[Flipmode] Claim skipped (may already be processing):", claimErr);
+      }
       const success = await this.coachClient.completeJob(jobId, article, []);
       if (success) {
-        let updatedContent = content.replace("status: draft", "status: sent");
-        updatedContent = updatedContent.replace("status: pending", "status: sent");
+        let updatedContent = content.replace("status: draft", "status: synced");
+        updatedContent = updatedContent.replace("status: pending", "status: synced");
         await this.app.vault.modify(file, updatedContent);
         const sentFolder = `${this.settings.syncFolder}/Sent`;
         await this.ensureFolder(sentFolder);
-        const newPath = `${sentFolder}/${file.name}`;
+        const baseName = file.basename.replace(/ \[synced\]$/, "");
+        const newFileName = `${baseName} [synced].md`;
+        const newPath = `${sentFolder}/${newFileName}`;
         await this.app.fileManager.renameFile(file, newPath);
-        new import_obsidian.Notice("Pushed to athlete!");
+        if (sourceFile) {
+          const sourceFilePath = this.app.metadataCache.getFirstLinkpathDest(sourceFile, file.path);
+          if (sourceFilePath) {
+            const sourceContent = await this.app.vault.read(sourceFilePath);
+            const updatedSource = sourceContent.replace("status: pending", "status: synced");
+            await this.app.vault.modify(sourceFilePath, updatedSource);
+          }
+        }
+        new import_obsidian.Notice(`Pushed to ${athleteName || "athlete"}!`);
       } else {
         new import_obsidian.Notice("Failed to push - check connection");
       }
@@ -628,6 +739,59 @@ ${article}`;
       console.error("Push error:", error);
       new import_obsidian.Notice("Failed to push article");
     }
+  }
+  async coachPushConcepts() {
+    var _a, _b;
+    if (!this.coachClient) {
+      new import_obsidian.Notice("Coach mode not configured");
+      return;
+    }
+    const conceptsFolder = `${this.settings.syncFolder}/Concepts`;
+    const conceptFiles = this.app.vault.getMarkdownFiles().filter(
+      (f) => f.path.startsWith(conceptsFolder) && !f.basename.startsWith("_")
+    );
+    if (conceptFiles.length === 0) {
+      new import_obsidian.Notice('No concepts found. Use "Explode to Concept Graph" first.');
+      return;
+    }
+    const concepts = [];
+    for (const file of conceptFiles) {
+      const content = await this.app.vault.read(file);
+      const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+      if (!fmMatch)
+        continue;
+      const fm = fmMatch[1];
+      const name = file.basename;
+      const category = ((_a = fm.match(/tags:.*?(\w+)\]$/m)) == null ? void 0 : _a[1]) || "technique";
+      const parent = ((_b = fm.match(/parent:\s*"([^"]+)"/)) == null ? void 0 : _b[1]) || null;
+      const summaryMatch = content.match(/## Summary\n\n([\s\S]*?)(?=\n## |$)/);
+      const summary = summaryMatch ? summaryMatch[1].trim() : "";
+      const prereqMatch = content.match(/## Prerequisites\n\n([\s\S]*?)(?=\n## |$)/);
+      const leadsToMatch = content.match(/## Leads To\n\n([\s\S]*?)(?=\n## |$)/);
+      const countersMatch = content.match(/## Counters\n\n([\s\S]*?)(?=\n## |$)/);
+      const relatedMatch = content.match(/## Related Concepts\n\n([\s\S]*?)(?=\n## |$)/);
+      const extractLinks = (text) => {
+        if (!text)
+          return [];
+        const links = text.match(/\[\[([^\]]+)\]\]/g) || [];
+        return links.map((l) => l.replace(/\[\[|\]\]/g, ""));
+      };
+      concepts.push({
+        name,
+        category,
+        parent,
+        summary,
+        prerequisites: extractLinks(prereqMatch == null ? void 0 : prereqMatch[1]),
+        leads_to: extractLinks(leadsToMatch == null ? void 0 : leadsToMatch[1]),
+        counters: extractLinks(countersMatch == null ? void 0 : countersMatch[1]),
+        related: extractLinks(relatedMatch == null ? void 0 : relatedMatch[1])
+      });
+    }
+    if (concepts.length === 0) {
+      new import_obsidian.Notice("No valid concepts found");
+      return;
+    }
+    new CoachPushConceptsModal(this.app, this, concepts).open();
   }
   async coachAddAthlete() {
     if (!this.coachClient) {
@@ -814,6 +978,145 @@ This note will be updated when results are ready.
       window.clearInterval(this.pollIntervalId);
     }
   }
+  async syncFromCoach() {
+    if (!this.queueClient) {
+      new import_obsidian.Notice("Remote mode not configured - check settings");
+      return;
+    }
+    new import_obsidian.Notice("Checking for completed research...");
+    try {
+      const jobs = await this.queueClient.listJobs();
+      const completedJobs = jobs.filter((j) => j.status === "complete");
+      if (completedJobs.length === 0) {
+        new import_obsidian.Notice("No completed research to sync");
+        return;
+      }
+      let synced = 0;
+      for (const job of completedJobs) {
+        const existingFile = this.findFileByJobId(job.job_id);
+        if (existingFile) {
+          console.log("[Flipmode] Already synced:", job.job_id);
+          continue;
+        }
+        const result = await this.queueClient.getResult(job.job_id);
+        if (result.article) {
+          const filename = await this.saveCoachArticleToVault(job, result);
+          console.log("[Flipmode] Synced:", filename);
+          synced++;
+        }
+      }
+      let conceptsSynced = 0;
+      try {
+        const concepts = await this.queueClient.getConcepts();
+        if (concepts.length > 0) {
+          conceptsSynced = await this.syncConceptsToVault(concepts);
+        }
+      } catch (err) {
+        console.log("[Flipmode] No concepts to sync or error:", err);
+      }
+      if (synced > 0 || conceptsSynced > 0) {
+        const msg = [];
+        if (synced > 0)
+          msg.push(`${synced} research article(s)`);
+        if (conceptsSynced > 0)
+          msg.push(`${conceptsSynced} concept(s)`);
+        new import_obsidian.Notice(`Synced ${msg.join(" and ")} from coach!`);
+      } else {
+        new import_obsidian.Notice("All research already synced");
+      }
+    } catch (error) {
+      console.error("[Flipmode] Sync error:", error);
+      new import_obsidian.Notice("Failed to sync from coach");
+    }
+  }
+  async syncConceptsToVault(concepts) {
+    var _a;
+    const folder = `${this.settings.syncFolder}/Concepts`;
+    await this.ensureFolder(folder);
+    let created = 0;
+    for (const concept of concepts) {
+      const conceptName = concept.name.replace(/[^\w\s-]/g, "").trim();
+      const conceptPath = `${folder}/${conceptName}.md`;
+      const existing = this.app.vault.getAbstractFileByPath(conceptPath);
+      if (existing)
+        continue;
+      const parentLink = concept.parent ? `[[${concept.parent}]]` : "Root concept";
+      const prereqLinks = (concept.prerequisites || []).map((p) => `- [[${p}]]`).join("\n") || "- None";
+      const leadsToLinks = (concept.leads_to || []).map((l) => `- [[${l}]]`).join("\n") || "- None";
+      const counterLinks = (concept.counters || []).map((c) => `- [[${c}]]`).join("\n") || "- None";
+      const relatedLinks = (concept.related || []).map((r) => `- [[${r}]]`).join("\n") || "- None";
+      const content = `---
+type: concept
+parent: "${concept.parent || ""}"
+tags: [concept, bjj, ${((_a = concept.category) == null ? void 0 : _a.toLowerCase()) || "technique"}]
+---
+
+# ${concept.name}
+
+**Category:** ${concept.category || "Technique"}
+**Parent:** ${parentLink}
+
+## Summary
+
+${concept.summary || "No summary available."}
+
+## Prerequisites
+
+${prereqLinks}
+
+## Leads To
+
+${leadsToLinks}
+
+## Counters
+
+${counterLinks}
+
+## Related Concepts
+
+${relatedLinks}
+`;
+      await this.app.vault.create(conceptPath, content);
+      created++;
+    }
+    return created;
+  }
+  findFileByJobId(jobId) {
+    var _a;
+    const files = this.app.vault.getMarkdownFiles();
+    for (const file of files) {
+      const cache = this.app.metadataCache.getFileCache(file);
+      if (((_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.job_id) === jobId) {
+        return file;
+      }
+    }
+    return null;
+  }
+  async saveCoachArticleToVault(job, result) {
+    const folder = `${this.settings.syncFolder}/Research`;
+    await this.ensureFolder(folder);
+    const date = new Date().toISOString().split("T")[0];
+    const shortQuery = (job.enriched_query || job.query_text || "Research").substring(0, 50).replace(/[^\w\s-]/g, "").trim();
+    const filename = `${folder}/${date} - ${shortQuery}.md`;
+    const content = `---
+type: coach-research
+job_id: ${job.job_id}
+query: "${job.enriched_query || job.query_text}"
+received: ${new Date().toISOString()}
+rlm_session_id: ${result.rlm_session_id || ""}
+tags: [bjj, research, from-coach]
+---
+
+# Research: ${shortQuery}
+
+${result.article}
+
+---
+*Research provided by your coach*
+`;
+    await this.app.vault.create(filename, content);
+    return filename;
+  }
   isRemoteMode() {
     return this.settings.mode === "remote" && !!this.queueClient;
   }
@@ -889,6 +1192,46 @@ This note will be updated when results are ready.
         "Authorization": `Bearer ${this.settings.athleteToken}`
       }
     });
+    return response.json;
+  }
+  // Start remote therapy session (after transcription)
+  async startRemoteTherapy(transcript) {
+    var _a;
+    if (!this.settings.queueServiceUrl || !this.settings.athleteToken) {
+      throw new Error("Requires queue service URL and athlete token");
+    }
+    const response = await (0, import_obsidian.requestUrl)({
+      url: `${this.settings.queueServiceUrl}/api/therapy/start`,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.settings.athleteToken}`
+      },
+      body: JSON.stringify({ transcript })
+    });
+    if (response.status >= 400) {
+      throw new Error(((_a = response.json) == null ? void 0 : _a.error) || "Failed to start therapy session");
+    }
+    return response.json;
+  }
+  // Continue remote therapy session with answer
+  async respondToRemoteTherapy(sessionId, answer) {
+    var _a;
+    if (!this.settings.queueServiceUrl || !this.settings.athleteToken) {
+      throw new Error("Requires queue service URL and athlete token");
+    }
+    const response = await (0, import_obsidian.requestUrl)({
+      url: `${this.settings.queueServiceUrl}/api/therapy/respond`,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.settings.athleteToken}`
+      },
+      body: JSON.stringify({ session_id: sessionId, answer })
+    });
+    if (response.status >= 400) {
+      throw new Error(((_a = response.json) == null ? void 0 : _a.error) || "Failed to continue therapy session");
+    }
     return response.json;
   }
   async checkConnection() {
@@ -1340,6 +1683,98 @@ ${deepDiveContent}
     } catch (error) {
       console.error("Deep Dive error:", error);
       new import_obsidian.Notice("Deep Dive failed. Check console for details.", 5e3);
+    }
+  }
+  // Explode article content into linked concept graph nodes
+  async explodeToConceptGraph(editor, view, selection) {
+    var _a;
+    const file = view.file;
+    if (!file) {
+      new import_obsidian.Notice("No file open");
+      return;
+    }
+    const contentToExplode = selection.trim();
+    if (!contentToExplode || contentToExplode.length < 100) {
+      new import_obsidian.Notice("Select more text to explode (at least a paragraph)");
+      return;
+    }
+    new import_obsidian.Notice("Exploding to concept graph...", 3e3);
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/explode-concepts`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify({
+          content: contentToExplode,
+          source_file: file.basename
+        })
+      });
+      const result = response.json;
+      if (result.error) {
+        new import_obsidian.Notice(`Explode failed: ${result.error}`, 5e3);
+        return;
+      }
+      const concepts = result.concepts || [];
+      if (concepts.length === 0) {
+        new import_obsidian.Notice("No concepts extracted");
+        return;
+      }
+      const conceptsFolder = `${this.settings.syncFolder}/Concepts`;
+      await this.ensureFolder(conceptsFolder);
+      let createdCount = 0;
+      for (const concept of concepts) {
+        const conceptName = concept.name.replace(/[^\w\s-]/g, "").trim();
+        const conceptPath = `${conceptsFolder}/${conceptName}.md`;
+        const existing = this.app.vault.getAbstractFileByPath(conceptPath);
+        if (existing) {
+          continue;
+        }
+        const parentLink = concept.parent ? `[[${concept.parent}]]` : "Root concept";
+        const prereqLinks = (concept.prerequisites || []).map((p) => `- [[${p}]]`).join("\n") || "- None";
+        const leadsToLinks = (concept.leads_to || []).map((l) => `- [[${l}]]`).join("\n") || "- None";
+        const counterLinks = (concept.counters || []).map((c) => `- [[${c}]]`).join("\n") || "- None";
+        const relatedLinks = (concept.related || []).map((r) => `- [[${r}]]`).join("\n") || "- None";
+        const conceptContent = `---
+type: concept
+parent: "${concept.parent || ""}"
+tags: [concept, bjj, ${((_a = concept.category) == null ? void 0 : _a.toLowerCase()) || "technique"}]
+---
+
+# ${concept.name}
+
+**Category:** ${concept.category || "Technique"}
+**Parent:** ${parentLink}
+
+## Summary
+
+${concept.summary || "No summary available."}
+
+## Prerequisites
+
+${prereqLinks}
+
+## Leads To
+
+${leadsToLinks}
+
+## Counters
+
+${counterLinks}
+
+## Related Concepts
+
+${relatedLinks}
+`;
+        await this.app.vault.create(conceptPath, conceptContent);
+        createdCount++;
+      }
+      new import_obsidian.Notice(`Created ${createdCount} concept nodes! Open Graph View to explore.`, 5e3);
+    } catch (error) {
+      console.error("Explode to Concept Graph error:", error);
+      new import_obsidian.Notice("Failed to explode concepts. Check console.", 5e3);
     }
   }
   // Generate Skill Development sessions from selected text (right-click context menu)
@@ -2005,6 +2440,8 @@ var VoiceNoteModal = class extends import_obsidian.Modal {
     this.timerInterval = null;
     this.recordingStartTime = 0;
     this.currentSessionId = null;
+    // Track remote therapy session
+    this.remoteTherapySessionId = null;
     this.plugin = plugin;
   }
   onOpen() {
@@ -2179,10 +2616,10 @@ var VoiceNoteModal = class extends import_obsidian.Modal {
       });
     }
   }
-  // Show transcript confirmation for remote (athlete) mode
-  showRemoteTranscriptConfirmation(transcript, usage) {
+  // Show transcript confirmation for remote (athlete) mode - starts therapy session
+  async showRemoteTranscriptConfirmation(transcript, usage) {
     this.resultEl.empty();
-    this.statusEl.setText("Review your transcription");
+    this.statusEl.setText("Starting therapy session...");
     this.statusEl.style.color = "var(--text-accent)";
     const usageEl = this.resultEl.createEl("p", {
       text: `Voice notes today: ${usage.count}/${usage.limit} (${usage.remaining} remaining)`
@@ -2191,6 +2628,180 @@ var VoiceNoteModal = class extends import_obsidian.Modal {
     usageEl.style.color = "var(--text-muted)";
     usageEl.style.fontSize = "0.85em";
     usageEl.style.marginBottom = "10px";
+    try {
+      const therapyResult = await this.plugin.startRemoteTherapy(transcript);
+      if (therapyResult.state === "ready") {
+        this.showEnrichedQueryConfirmation(therapyResult.enriched_query, transcript);
+      } else {
+        this.remoteTherapySessionId = therapyResult.session_id;
+        this.showTherapyQuestion(therapyResult.question, transcript);
+      }
+    } catch (error) {
+      console.error("Therapy start error:", error);
+      this.showDirectSubmitForm(transcript, usage);
+    }
+  }
+  // Show therapy question and let athlete respond
+  showTherapyQuestion(question, originalTranscript) {
+    this.resultEl.empty();
+    this.statusEl.setText("Clarifying your training...");
+    this.statusEl.style.color = "var(--text-accent)";
+    const origEl = this.resultEl.createEl("p", {
+      text: `"${originalTranscript.substring(0, 100)}${originalTranscript.length > 100 ? "..." : ""}"`
+    });
+    origEl.style.cssText = "font-style: italic; color: var(--text-muted); font-size: 0.9em; margin-bottom: 15px;";
+    const questionEl = this.resultEl.createEl("p", { text: question });
+    questionEl.style.cssText = "font-weight: 500; margin-bottom: 15px; line-height: 1.5;";
+    const textarea = this.resultEl.createEl("textarea");
+    textarea.placeholder = "Type your answer...";
+    textarea.style.cssText = `
+            width: 100%;
+            min-height: 80px;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid var(--background-modifier-border);
+            background: var(--background-primary);
+            color: var(--text-normal);
+            font-size: 14px;
+            resize: vertical;
+            margin-bottom: 15px;
+        `;
+    const btnContainer = this.resultEl.createDiv();
+    btnContainer.style.cssText = "display: flex; gap: 10px; justify-content: center;";
+    const answerBtn = btnContainer.createEl("button", { text: "Answer" });
+    answerBtn.style.cssText = `
+            padding: 10px 20px;
+            background: var(--interactive-accent);
+            color: var(--text-on-accent);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+        `;
+    answerBtn.onclick = async () => {
+      const answer = textarea.value.trim();
+      if (!answer) {
+        new import_obsidian.Notice("Please type an answer");
+        return;
+      }
+      answerBtn.disabled = true;
+      answerBtn.setText("Processing...");
+      try {
+        const result = await this.plugin.respondToRemoteTherapy(
+          this.remoteTherapySessionId,
+          answer
+        );
+        if (result.state === "ready") {
+          this.showEnrichedQueryConfirmation(result.enriched_query, originalTranscript);
+        } else {
+          this.showTherapyQuestion(result.question, originalTranscript);
+        }
+      } catch (error) {
+        new import_obsidian.Notice(`Error: ${error.message}`);
+        answerBtn.disabled = false;
+        answerBtn.setText("Answer");
+      }
+    };
+    const skipBtn = btnContainer.createEl("button", { text: "Skip & Submit" });
+    skipBtn.style.cssText = `
+            padding: 10px 20px;
+            background: var(--background-modifier-border);
+            color: var(--text-normal);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        `;
+    skipBtn.onclick = () => {
+      this.showEnrichedQueryConfirmation(originalTranscript, originalTranscript);
+    };
+    this.recordBtn.setText("VOICE ANSWER");
+    this.recordBtn.disabled = false;
+    this.recordBtn.style.background = "var(--interactive-accent)";
+  }
+  // Show enriched query for final confirmation before submitting
+  showEnrichedQueryConfirmation(enrichedQuery, originalTranscript) {
+    this.resultEl.empty();
+    this.statusEl.setText("Ready to submit to analyst");
+    this.statusEl.style.color = "var(--text-success)";
+    const labelEl = this.resultEl.createEl("p", { text: "Your research query:" });
+    labelEl.style.cssText = "font-weight: 500; margin-bottom: 10px;";
+    const textarea = this.resultEl.createEl("textarea");
+    textarea.value = enrichedQuery;
+    textarea.style.cssText = `
+            width: 100%;
+            min-height: 80px;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid var(--background-modifier-border);
+            background: var(--background-primary);
+            color: var(--text-normal);
+            font-size: 14px;
+            resize: vertical;
+            margin-bottom: 15px;
+        `;
+    const btnContainer = this.resultEl.createDiv();
+    btnContainer.style.cssText = "display: flex; gap: 10px; justify-content: center;";
+    const submitBtn = btnContainer.createEl("button", { text: "Submit to Analyst" });
+    submitBtn.style.cssText = `
+            padding: 10px 20px;
+            background: var(--interactive-accent);
+            color: var(--text-on-accent);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+        `;
+    submitBtn.onclick = async () => {
+      var _a;
+      const finalQuery = textarea.value.trim();
+      if (!finalQuery) {
+        new import_obsidian.Notice("Please enter a query");
+        return;
+      }
+      submitBtn.disabled = true;
+      submitBtn.setText("Submitting...");
+      try {
+        await ((_a = this.plugin.queueClient) == null ? void 0 : _a.submitQuery(finalQuery, {
+          original_transcript: originalTranscript,
+          therapy_session_id: this.remoteTherapySessionId
+        }));
+        new import_obsidian.Notice("Query submitted to analyst!");
+        await this.saveRemoteVoiceNote(originalTranscript + "\n\n---\n\n**Research Query:** " + finalQuery);
+        this.statusEl.setText("Submitted! Your analyst will process this.");
+        this.statusEl.style.color = "var(--text-success)";
+        this.recordBtn.setText("RECORD ANOTHER");
+        this.recordBtn.disabled = false;
+        this.recordBtn.style.background = "var(--interactive-accent)";
+        this.remoteTherapySessionId = null;
+      } catch (error) {
+        new import_obsidian.Notice(`Submit failed: ${error.message}`);
+        submitBtn.disabled = false;
+        submitBtn.setText("Submit to Analyst");
+      }
+    };
+    const saveOnlyBtn = btnContainer.createEl("button", { text: "Save Only" });
+    saveOnlyBtn.style.cssText = `
+            padding: 10px 20px;
+            background: var(--background-modifier-border);
+            color: var(--text-normal);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        `;
+    saveOnlyBtn.onclick = async () => {
+      await this.saveRemoteVoiceNote(originalTranscript + "\n\n---\n\n**Research Query:** " + textarea.value);
+      new import_obsidian.Notice("Voice note saved to vault");
+      this.close();
+    };
+    this.recordBtn.setText("RECORD NEW");
+    this.recordBtn.disabled = false;
+    this.recordBtn.style.background = "var(--interactive-accent)";
+  }
+  // Fallback: direct submit form (if therapy fails)
+  showDirectSubmitForm(transcript, usage) {
+    this.resultEl.empty();
+    this.statusEl.setText("Review your transcription");
+    this.statusEl.style.color = "var(--text-accent)";
     const textarea = this.resultEl.createEl("textarea");
     textarea.value = transcript;
     textarea.style.cssText = `
@@ -2227,7 +2838,7 @@ var VoiceNoteModal = class extends import_obsidian.Modal {
       submitBtn.disabled = true;
       submitBtn.setText("Submitting...");
       try {
-        await ((_a = this.plugin.remoteClient) == null ? void 0 : _a.submitQuery(finalText));
+        await ((_a = this.plugin.queueClient) == null ? void 0 : _a.submitQuery(finalText));
         new import_obsidian.Notice("Query submitted to analyst!");
         await this.saveRemoteVoiceNote(finalText);
         this.statusEl.setText("Submitted! Your analyst will process this.");
@@ -2240,23 +2851,6 @@ var VoiceNoteModal = class extends import_obsidian.Modal {
         submitBtn.disabled = false;
         submitBtn.setText("Submit to Analyst");
       }
-    };
-    const saveOnlyBtn = btnContainer.createEl("button", { text: "Save Only" });
-    saveOnlyBtn.style.cssText = `
-            padding: 10px 20px;
-            background: var(--background-modifier-border);
-            color: var(--text-normal);
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-        `;
-    saveOnlyBtn.onclick = async () => {
-      const finalText = textarea.value.trim();
-      if (finalText) {
-        await this.saveRemoteVoiceNote(finalText);
-        new import_obsidian.Notice("Voice note saved to vault");
-      }
-      this.close();
     };
     this.recordBtn.setText("RECORD MORE");
     this.recordBtn.disabled = false;
@@ -3315,6 +3909,69 @@ var CoachAddAthleteModal = class extends import_obsidian.Modal {
         this.close();
       } catch (error) {
         new import_obsidian.Notice("Failed to add athlete");
+      }
+    }));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var CoachPushConceptsModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, concepts) {
+    super(app);
+    this.plugin = plugin;
+    this.concepts = concepts;
+  }
+  async onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: "Push Concepts to Athlete" });
+    contentEl.createEl("p", { text: `${this.concepts.length} concepts ready to push` });
+    let athletes = [];
+    try {
+      athletes = await this.plugin.coachClient.getAthletes();
+    } catch (e) {
+      contentEl.createEl("p", { text: "Failed to load athletes" });
+      return;
+    }
+    if (athletes.length === 0) {
+      contentEl.createEl("p", { text: "No athletes in roster. Add athletes first." });
+      return;
+    }
+    let selectedAthleteId = null;
+    new import_obsidian.Setting(contentEl).setName("Select Athlete").addDropdown((dropdown) => {
+      dropdown.addOption("", "Choose athlete...");
+      for (const athlete of athletes) {
+        dropdown.addOption(
+          String(athlete.id),
+          athlete.display_name || athlete.discord_username || `Athlete ${athlete.id}`
+        );
+      }
+      dropdown.onChange((value) => {
+        selectedAthleteId = value ? parseInt(value) : null;
+      });
+    });
+    const listEl = contentEl.createEl("div", { cls: "concept-list" });
+    listEl.createEl("h4", { text: "Concepts:" });
+    const ul = listEl.createEl("ul");
+    for (const c of this.concepts.slice(0, 10)) {
+      ul.createEl("li", { text: `${c.name} (${c.category})` });
+    }
+    if (this.concepts.length > 10) {
+      ul.createEl("li", { text: `... and ${this.concepts.length - 10} more` });
+    }
+    new import_obsidian.Setting(contentEl).addButton((btn) => btn.setButtonText("Push Concepts").setCta().onClick(async () => {
+      if (!selectedAthleteId) {
+        new import_obsidian.Notice("Select an athlete first");
+        return;
+      }
+      try {
+        new import_obsidian.Notice("Pushing concepts...");
+        const result = await this.plugin.coachClient.pushConcepts(selectedAthleteId, this.concepts);
+        new import_obsidian.Notice(`Pushed! ${result.created} new, ${result.updated} updated`);
+        this.close();
+      } catch (error) {
+        console.error("Push concepts error:", error);
+        new import_obsidian.Notice("Failed to push concepts");
       }
     }));
   }

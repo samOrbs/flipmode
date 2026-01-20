@@ -144,6 +144,17 @@ class RemoteQueueClient {
         });
     }
 
+    async getConcepts(): Promise<any[]> {
+        const response = await requestUrl({
+            url: `${this.baseUrl}/api/queue/concepts`,
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${this.token}`
+            }
+        });
+        return response.json.concepts || [];
+    }
+
     async checkHealth(): Promise<boolean> {
         try {
             const response = await requestUrl({
@@ -257,6 +268,22 @@ class CoachQueueClient {
             return false;
         }
     }
+
+    async pushConcepts(athleteId: number, concepts: any[]): Promise<{ created: number; updated: number }> {
+        const response = await requestUrl({
+            url: `${this.baseUrl}/api/queue/concepts/push`,
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${this.token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                athlete_id: athleteId,
+                concepts: concepts
+            })
+        });
+        return response.json;
+    }
 }
 
 export default class BJJFlipmodePlugin extends Plugin {
@@ -353,6 +380,12 @@ export default class BJJFlipmodePlugin extends Plugin {
         });
 
         this.addCommand({
+            id: 'flipmode-coach-push-concepts',
+            name: 'Coach: Push concepts to athlete',
+            callback: () => this.coachPushConcepts()
+        });
+
+        this.addCommand({
             id: 'flipmode-coach-add-athlete',
             name: 'Coach: Add athlete to roster',
             callback: () => this.coachAddAthlete()
@@ -390,6 +423,15 @@ export default class BJJFlipmodePlugin extends Plugin {
             }
         });
 
+        // Athlete: Sync completed research from coach
+        this.addCommand({
+            id: 'flipmode-sync-from-coach',
+            name: 'Sync from Coach (fetch completed research)',
+            callback: async () => {
+                await this.syncFromCoach();
+            }
+        });
+
         // Add settings tab
         this.addSettingTab(new BJJFlipmodeSettingTab(this.app, this));
 
@@ -421,6 +463,15 @@ export default class BJJFlipmodePlugin extends Plugin {
                             .setIcon('search')
                             .onClick(async () => {
                                 await this.diveDeeper(editor, view, selection);
+                            });
+                    });
+                    // Explode to Concept Graph
+                    menu.addItem((item) => {
+                        item
+                            .setTitle('Explode to Concept Graph')
+                            .setIcon('git-branch')
+                            .onClick(async () => {
+                                await this.explodeToConceptGraph(editor, view, selection);
                             });
                     });
                 }
@@ -718,51 +769,141 @@ ${job.query_text}
     }
 
     async coachPushArticle(view: MarkdownView) {
+        console.log('[Flipmode] coachPushArticle called');
+        new Notice('Starting push...');
+
         if (!this.coachClient) {
-            new Notice('Coach mode not configured');
+            new Notice('Coach mode not configured - check settings');
+            console.log('[Flipmode] coachClient is null, mode:', this.settings.mode, 'token:', this.settings.coachToken?.substring(0, 8));
             return;
         }
 
         const file = view.file;
-        if (!file) return;
-
-        const cache = this.app.metadataCache.getFileCache(file);
-        const frontmatter = cache?.frontmatter;
-
-        if (!frontmatter?.job_id) {
-            new Notice('Not a query note (no job_id in frontmatter)');
+        if (!file) {
+            new Notice('No file open');
+            console.log('[Flipmode] No file in view');
             return;
         }
 
-        const jobId = frontmatter.job_id;
         const content = await this.app.vault.read(file);
+        console.log('[Flipmode] Push article - file:', file.path);
 
-        // Extract article (everything after "## Generated Article")
-        const articleMatch = content.match(/## Generated Article\n\n([\s\S]*?)$/);
-        const article = articleMatch ? articleMatch[1].trim() : '';
+        // Parse frontmatter from content
+        let jobId: string | null = null;
+        let athleteName: string | null = null;
+        let sourceFile: string | null = null;
+        let fileType: string | null = null;
+
+        const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+        if (fmMatch) {
+            const fmContent = fmMatch[1];
+            const typeMatch = fmContent.match(/type:\s*(.+)/);
+            const jobIdMatch = fmContent.match(/job_id:\s*(.+)/);
+            const athleteMatch = fmContent.match(/athlete_name:\s*(.+)/);
+            const sourceMatch = fmContent.match(/source_file:\s*"?\[\[([^\]]+)\]\]"?/);
+
+            if (typeMatch) fileType = typeMatch[1].trim();
+            if (jobIdMatch) jobId = jobIdMatch[1].trim();
+            if (athleteMatch) athleteName = athleteMatch[1].trim();
+            if (sourceMatch) sourceFile = sourceMatch[1].trim();
+        }
+
+        console.log('[Flipmode] File type:', fileType, 'job_id:', jobId, 'source_file:', sourceFile);
+
+        // If this is a Training Review, get job_id from the linked source query
+        if (fileType === 'training-review' && sourceFile && !jobId) {
+            console.log('[Flipmode] Training Review - looking up source query:', sourceFile);
+
+            // Find the source file
+            const sourceFilePath = this.app.metadataCache.getFirstLinkpathDest(sourceFile, file.path);
+            if (sourceFilePath) {
+                const sourceContent = await this.app.vault.read(sourceFilePath);
+                const sourceFmMatch = sourceContent.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+                if (sourceFmMatch) {
+                    const sourceFm = sourceFmMatch[1];
+                    const sourceJobId = sourceFm.match(/job_id:\s*(.+)/);
+                    const sourceAthlete = sourceFm.match(/athlete_name:\s*(.+)/);
+                    if (sourceJobId) jobId = sourceJobId[1].trim();
+                    if (sourceAthlete) athleteName = sourceAthlete[1].trim();
+                    console.log('[Flipmode] Got from source - job_id:', jobId, 'athlete:', athleteName);
+                }
+            } else {
+                console.log('[Flipmode] Could not find source file:', sourceFile);
+            }
+        }
+
+        if (!jobId) {
+            new Notice('Cannot push: no job_id found (check source query link)');
+            return;
+        }
+
+        // For Training Reviews, use the main content (after frontmatter, skip the warning banner)
+        let article: string;
+        if (fileType === 'training-review') {
+            // Remove frontmatter and warning banner, get the actual content
+            const contentAfterFm = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+            // Remove the draft warning block and "Listen to Review" block
+            article = contentAfterFm
+                .replace(/> \[!warning\][\s\S]*?(?=\n## |\n# )/g, '')
+                .replace(/## Listen to Review[\s\S]*?(?=\n## |\n# )/g, '')
+                .replace(/## Deep Dive[\s\S]*?(?=\n## |$)/g, '')
+                .replace(/## Links[\s\S]*$/g, '')
+                .trim();
+        } else {
+            // For query notes, extract from "## Generated Article" section
+            const articleMatch = content.match(/## Generated Article\n\n([\s\S]*?)$/);
+            article = articleMatch ? articleMatch[1].trim() : '';
+        }
 
         if (!article || article.includes('Run "Coach: Generate article"')) {
             new Notice('No article content to push');
             return;
         }
 
+        console.log('[Flipmode] Article length:', article.length);
+
         new Notice('Pushing to athlete...');
 
         try {
+            // First claim the job (moves from pending → processing)
+            try {
+                await this.coachClient.claimJob(jobId);
+                console.log('[Flipmode] Job claimed');
+            } catch (claimErr) {
+                // May already be claimed, continue anyway
+                console.log('[Flipmode] Claim skipped (may already be processing):', claimErr);
+            }
+
+            // Then complete it
             const success = await this.coachClient.completeJob(jobId, article, []);
 
             if (success) {
-                // Update status and move to Sent
-                let updatedContent = content.replace('status: draft', 'status: sent');
-                updatedContent = updatedContent.replace('status: pending', 'status: sent');
+                // Update status in frontmatter
+                let updatedContent = content.replace('status: draft', 'status: synced');
+                updatedContent = updatedContent.replace('status: pending', 'status: synced');
                 await this.app.vault.modify(file, updatedContent);
 
+                // Move to Sent folder with "synced" in filename
                 const sentFolder = `${this.settings.syncFolder}/Sent`;
                 await this.ensureFolder(sentFolder);
-                const newPath = `${sentFolder}/${file.name}`;
+
+                // Rename to show synced status, preserving original name structure
+                const baseName = file.basename.replace(/ \[synced\]$/, ''); // Remove if already there
+                const newFileName = `${baseName} [synced].md`;
+                const newPath = `${sentFolder}/${newFileName}`;
                 await this.app.fileManager.renameFile(file, newPath);
 
-                new Notice('Pushed to athlete!');
+                // Also update the source query note status
+                if (sourceFile) {
+                    const sourceFilePath = this.app.metadataCache.getFirstLinkpathDest(sourceFile, file.path);
+                    if (sourceFilePath) {
+                        const sourceContent = await this.app.vault.read(sourceFilePath);
+                        const updatedSource = sourceContent.replace('status: pending', 'status: synced');
+                        await this.app.vault.modify(sourceFilePath, updatedSource);
+                    }
+                }
+
+                new Notice(`Pushed to ${athleteName || 'athlete'}!`);
             } else {
                 new Notice('Failed to push - check connection');
             }
@@ -770,6 +911,72 @@ ${job.query_text}
             console.error('Push error:', error);
             new Notice('Failed to push article');
         }
+    }
+
+    async coachPushConcepts() {
+        if (!this.coachClient) {
+            new Notice('Coach mode not configured');
+            return;
+        }
+
+        // Read all concept files from Concepts folder
+        const conceptsFolder = `${this.settings.syncFolder}/Concepts`;
+        const conceptFiles = this.app.vault.getMarkdownFiles().filter(f =>
+            f.path.startsWith(conceptsFolder) && !f.basename.startsWith('_')
+        );
+
+        if (conceptFiles.length === 0) {
+            new Notice('No concepts found. Use "Explode to Concept Graph" first.');
+            return;
+        }
+
+        // Parse concepts from files
+        const concepts: any[] = [];
+        for (const file of conceptFiles) {
+            const content = await this.app.vault.read(file);
+            const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+            if (!fmMatch) continue;
+
+            const fm = fmMatch[1];
+            const name = file.basename;
+            const category = fm.match(/tags:.*?(\w+)\]$/m)?.[1] || 'technique';
+            const parent = fm.match(/parent:\s*"([^"]+)"/)?.[1] || null;
+
+            // Extract summary
+            const summaryMatch = content.match(/## Summary\n\n([\s\S]*?)(?=\n## |$)/);
+            const summary = summaryMatch ? summaryMatch[1].trim() : '';
+
+            // Extract linked concepts
+            const prereqMatch = content.match(/## Prerequisites\n\n([\s\S]*?)(?=\n## |$)/);
+            const leadsToMatch = content.match(/## Leads To\n\n([\s\S]*?)(?=\n## |$)/);
+            const countersMatch = content.match(/## Counters\n\n([\s\S]*?)(?=\n## |$)/);
+            const relatedMatch = content.match(/## Related Concepts\n\n([\s\S]*?)(?=\n## |$)/);
+
+            const extractLinks = (text: string | undefined): string[] => {
+                if (!text) return [];
+                const links = text.match(/\[\[([^\]]+)\]\]/g) || [];
+                return links.map(l => l.replace(/\[\[|\]\]/g, ''));
+            };
+
+            concepts.push({
+                name,
+                category,
+                parent,
+                summary,
+                prerequisites: extractLinks(prereqMatch?.[1]),
+                leads_to: extractLinks(leadsToMatch?.[1]),
+                counters: extractLinks(countersMatch?.[1]),
+                related: extractLinks(relatedMatch?.[1])
+            });
+        }
+
+        if (concepts.length === 0) {
+            new Notice('No valid concepts found');
+            return;
+        }
+
+        // Ask which athlete to push to
+        new CoachPushConceptsModal(this.app, this, concepts).open();
     }
 
     async coachAddAthlete() {
@@ -1003,6 +1210,169 @@ This note will be updated when results are ready.
         }
     }
 
+    async syncFromCoach() {
+        if (!this.queueClient) {
+            new Notice('Remote mode not configured - check settings');
+            return;
+        }
+
+        new Notice('Checking for completed research...');
+
+        try {
+            const jobs = await this.queueClient.listJobs();
+            const completedJobs = jobs.filter((j: any) => j.status === 'complete');
+
+            if (completedJobs.length === 0) {
+                new Notice('No completed research to sync');
+                return;
+            }
+
+            let synced = 0;
+            for (const job of completedJobs) {
+                // Check if already saved (look for file with job_id in frontmatter)
+                const existingFile = this.findFileByJobId(job.job_id);
+                if (existingFile) {
+                    console.log('[Flipmode] Already synced:', job.job_id);
+                    continue;
+                }
+
+                // Fetch full result
+                const result = await this.queueClient.getResult(job.job_id);
+                if (result.article) {
+                    const filename = await this.saveCoachArticleToVault(job, result);
+                    console.log('[Flipmode] Synced:', filename);
+                    synced++;
+                }
+            }
+
+            // Also sync concepts
+            let conceptsSynced = 0;
+            try {
+                const concepts = await this.queueClient.getConcepts();
+                if (concepts.length > 0) {
+                    conceptsSynced = await this.syncConceptsToVault(concepts);
+                }
+            } catch (err) {
+                console.log('[Flipmode] No concepts to sync or error:', err);
+            }
+
+            if (synced > 0 || conceptsSynced > 0) {
+                const msg = [];
+                if (synced > 0) msg.push(`${synced} research article(s)`);
+                if (conceptsSynced > 0) msg.push(`${conceptsSynced} concept(s)`);
+                new Notice(`Synced ${msg.join(' and ')} from coach!`);
+            } else {
+                new Notice('All research already synced');
+            }
+        } catch (error) {
+            console.error('[Flipmode] Sync error:', error);
+            new Notice('Failed to sync from coach');
+        }
+    }
+
+    async syncConceptsToVault(concepts: any[]): Promise<number> {
+        const folder = `${this.settings.syncFolder}/Concepts`;
+        await this.ensureFolder(folder);
+
+        let created = 0;
+        for (const concept of concepts) {
+            const conceptName = concept.name.replace(/[^\w\s-]/g, '').trim();
+            const conceptPath = `${folder}/${conceptName}.md`;
+
+            // Check if exists
+            const existing = this.app.vault.getAbstractFileByPath(conceptPath);
+            if (existing) continue;
+
+            // Build linked markdown
+            const parentLink = concept.parent ? `[[${concept.parent}]]` : 'Root concept';
+            const prereqLinks = (concept.prerequisites || []).map((p: string) => `- [[${p}]]`).join('\n') || '- None';
+            const leadsToLinks = (concept.leads_to || []).map((l: string) => `- [[${l}]]`).join('\n') || '- None';
+            const counterLinks = (concept.counters || []).map((c: string) => `- [[${c}]]`).join('\n') || '- None';
+            const relatedLinks = (concept.related || []).map((r: string) => `- [[${r}]]`).join('\n') || '- None';
+
+            const content = `---
+type: concept
+parent: "${concept.parent || ''}"
+tags: [concept, bjj, ${concept.category?.toLowerCase() || 'technique'}]
+---
+
+# ${concept.name}
+
+**Category:** ${concept.category || 'Technique'}
+**Parent:** ${parentLink}
+
+## Summary
+
+${concept.summary || 'No summary available.'}
+
+## Prerequisites
+
+${prereqLinks}
+
+## Leads To
+
+${leadsToLinks}
+
+## Counters
+
+${counterLinks}
+
+## Related Concepts
+
+${relatedLinks}
+`;
+
+            await this.app.vault.create(conceptPath, content);
+            created++;
+        }
+
+        return created;
+    }
+
+    findFileByJobId(jobId: string): TFile | null {
+        const files = this.app.vault.getMarkdownFiles();
+        for (const file of files) {
+            const cache = this.app.metadataCache.getFileCache(file);
+            if (cache?.frontmatter?.job_id === jobId) {
+                return file;
+            }
+        }
+        return null;
+    }
+
+    async saveCoachArticleToVault(job: any, result: any): Promise<string> {
+        const folder = `${this.settings.syncFolder}/Research`;
+        await this.ensureFolder(folder);
+
+        const date = new Date().toISOString().split('T')[0];
+        const shortQuery = (job.enriched_query || job.query_text || 'Research')
+            .substring(0, 50)
+            .replace(/[^\w\s-]/g, '')
+            .trim();
+
+        const filename = `${folder}/${date} - ${shortQuery}.md`;
+
+        const content = `---
+type: coach-research
+job_id: ${job.job_id}
+query: "${job.enriched_query || job.query_text}"
+received: ${new Date().toISOString()}
+rlm_session_id: ${result.rlm_session_id || ''}
+tags: [bjj, research, from-coach]
+---
+
+# Research: ${shortQuery}
+
+${result.article}
+
+---
+*Research provided by your coach*
+`;
+
+        await this.app.vault.create(filename, content);
+        return filename;
+    }
+
     isRemoteMode(): boolean {
         return this.settings.mode === 'remote' && !!this.queueClient;
     }
@@ -1093,6 +1463,52 @@ This note will be updated when results are ready.
                 'Authorization': `Bearer ${this.settings.athleteToken}`
             }
         });
+
+        return response.json;
+    }
+
+    // Start remote therapy session (after transcription)
+    async startRemoteTherapy(transcript: string): Promise<{session_id: string, state: string, question?: string, enriched_query?: string}> {
+        if (!this.settings.queueServiceUrl || !this.settings.athleteToken) {
+            throw new Error('Requires queue service URL and athlete token');
+        }
+
+        const response = await requestUrl({
+            url: `${this.settings.queueServiceUrl}/api/therapy/start`,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${this.settings.athleteToken}`
+            },
+            body: JSON.stringify({ transcript })
+        });
+
+        if (response.status >= 400) {
+            throw new Error(response.json?.error || 'Failed to start therapy session');
+        }
+
+        return response.json;
+    }
+
+    // Continue remote therapy session with answer
+    async respondToRemoteTherapy(sessionId: string, answer: string): Promise<{session_id: string, state: string, question?: string, enriched_query?: string}> {
+        if (!this.settings.queueServiceUrl || !this.settings.athleteToken) {
+            throw new Error('Requires queue service URL and athlete token');
+        }
+
+        const response = await requestUrl({
+            url: `${this.settings.queueServiceUrl}/api/therapy/respond`,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${this.settings.athleteToken}`
+            },
+            body: JSON.stringify({ session_id: sessionId, answer })
+        });
+
+        if (response.status >= 400) {
+            throw new Error(response.json?.error || 'Failed to continue therapy session');
+        }
 
         return response.json;
     }
@@ -1669,6 +2085,117 @@ ${deepDiveContent}
         } catch (error) {
             console.error('Deep Dive error:', error);
             new Notice('Deep Dive failed. Check console for details.', 5000);
+        }
+    }
+
+    // Explode article content into linked concept graph nodes
+    async explodeToConceptGraph(editor: Editor, view: MarkdownView, selection: string) {
+        const file = view.file;
+        if (!file) {
+            new Notice('No file open');
+            return;
+        }
+
+        const contentToExplode = selection.trim();
+        if (!contentToExplode || contentToExplode.length < 100) {
+            new Notice('Select more text to explode (at least a paragraph)');
+            return;
+        }
+
+        new Notice('Exploding to concept graph...', 3000);
+
+        try {
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/explode-concepts`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify({
+                    content: contentToExplode,
+                    source_file: file.basename
+                })
+            });
+
+            const result = response.json;
+
+            if (result.error) {
+                new Notice(`Explode failed: ${result.error}`, 5000);
+                return;
+            }
+
+            const concepts = result.concepts || [];
+            if (concepts.length === 0) {
+                new Notice('No concepts extracted');
+                return;
+            }
+
+            // Create Concepts folder
+            const conceptsFolder = `${this.settings.syncFolder}/Concepts`;
+            await this.ensureFolder(conceptsFolder);
+
+            // Create a note for each concept
+            let createdCount = 0;
+            for (const concept of concepts) {
+                const conceptName = concept.name.replace(/[^\w\s-]/g, '').trim();
+                const conceptPath = `${conceptsFolder}/${conceptName}.md`;
+
+                // Check if concept already exists
+                const existing = this.app.vault.getAbstractFileByPath(conceptPath);
+                if (existing) {
+                    // TODO: Could merge/update existing concept
+                    continue;
+                }
+
+                // Build linked markdown
+                const parentLink = concept.parent ? `[[${concept.parent}]]` : 'Root concept';
+                const prereqLinks = (concept.prerequisites || []).map((p: string) => `- [[${p}]]`).join('\n') || '- None';
+                const leadsToLinks = (concept.leads_to || []).map((l: string) => `- [[${l}]]`).join('\n') || '- None';
+                const counterLinks = (concept.counters || []).map((c: string) => `- [[${c}]]`).join('\n') || '- None';
+                const relatedLinks = (concept.related || []).map((r: string) => `- [[${r}]]`).join('\n') || '- None';
+
+                const conceptContent = `---
+type: concept
+parent: "${concept.parent || ''}"
+tags: [concept, bjj, ${concept.category?.toLowerCase() || 'technique'}]
+---
+
+# ${concept.name}
+
+**Category:** ${concept.category || 'Technique'}
+**Parent:** ${parentLink}
+
+## Summary
+
+${concept.summary || 'No summary available.'}
+
+## Prerequisites
+
+${prereqLinks}
+
+## Leads To
+
+${leadsToLinks}
+
+## Counters
+
+${counterLinks}
+
+## Related Concepts
+
+${relatedLinks}
+`;
+
+                await this.app.vault.create(conceptPath, conceptContent);
+                createdCount++;
+            }
+
+            new Notice(`Created ${createdCount} concept nodes! Open Graph View to explore.`, 5000);
+
+        } catch (error) {
+            console.error('Explode to Concept Graph error:', error);
+            new Notice('Failed to explode concepts. Check console.', 5000);
         }
     }
 
@@ -2758,11 +3285,14 @@ class VoiceNoteModal extends Modal {
         }
     }
 
-    // Show transcript confirmation for remote (athlete) mode
-    showRemoteTranscriptConfirmation(transcript: string, usage: any) {
+    // Track remote therapy session
+    remoteTherapySessionId: string | null = null;
+
+    // Show transcript confirmation for remote (athlete) mode - starts therapy session
+    async showRemoteTranscriptConfirmation(transcript: string, usage: any) {
         this.resultEl.empty();
 
-        this.statusEl.setText('Review your transcription');
+        this.statusEl.setText('Starting therapy session...');
         this.statusEl.style.color = 'var(--text-accent)';
 
         // Usage info
@@ -2774,12 +3304,138 @@ class VoiceNoteModal extends Modal {
         usageEl.style.fontSize = '0.85em';
         usageEl.style.marginBottom = '10px';
 
-        // Editable transcript
+        try {
+            // Start therapy session with transcript
+            const therapyResult = await this.plugin.startRemoteTherapy(transcript);
+
+            if (therapyResult.state === 'ready') {
+                // Already have enough info - show enriched query
+                this.showEnrichedQueryConfirmation(therapyResult.enriched_query, transcript);
+            } else {
+                // Need more info - show question
+                this.remoteTherapySessionId = therapyResult.session_id;
+                this.showTherapyQuestion(therapyResult.question, transcript);
+            }
+        } catch (error: any) {
+            console.error('Therapy start error:', error);
+            // Fall back to direct submit
+            this.showDirectSubmitForm(transcript, usage);
+        }
+    }
+
+    // Show therapy question and let athlete respond
+    showTherapyQuestion(question: string, originalTranscript: string) {
+        this.resultEl.empty();
+
+        this.statusEl.setText('Clarifying your training...');
+        this.statusEl.style.color = 'var(--text-accent)';
+
+        // Show original transcript (smaller)
+        const origEl = this.resultEl.createEl('p', {
+            text: `"${originalTranscript.substring(0, 100)}${originalTranscript.length > 100 ? '...' : ''}"`
+        });
+        origEl.style.cssText = 'font-style: italic; color: var(--text-muted); font-size: 0.9em; margin-bottom: 15px;';
+
+        // Show question from therapy
+        const questionEl = this.resultEl.createEl('p', { text: question });
+        questionEl.style.cssText = 'font-weight: 500; margin-bottom: 15px; line-height: 1.5;';
+
+        // Text input for answer
         const textarea = this.resultEl.createEl('textarea');
-        textarea.value = transcript;
+        textarea.placeholder = 'Type your answer...';
         textarea.style.cssText = `
             width: 100%;
-            min-height: 100px;
+            min-height: 80px;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid var(--background-modifier-border);
+            background: var(--background-primary);
+            color: var(--text-normal);
+            font-size: 14px;
+            resize: vertical;
+            margin-bottom: 15px;
+        `;
+
+        // Buttons
+        const btnContainer = this.resultEl.createDiv();
+        btnContainer.style.cssText = 'display: flex; gap: 10px; justify-content: center;';
+
+        const answerBtn = btnContainer.createEl('button', { text: 'Answer' });
+        answerBtn.style.cssText = `
+            padding: 10px 20px;
+            background: var(--interactive-accent);
+            color: var(--text-on-accent);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+        `;
+        answerBtn.onclick = async () => {
+            const answer = textarea.value.trim();
+            if (!answer) {
+                new Notice('Please type an answer');
+                return;
+            }
+
+            answerBtn.disabled = true;
+            answerBtn.setText('Processing...');
+
+            try {
+                const result = await this.plugin.respondToRemoteTherapy(
+                    this.remoteTherapySessionId!,
+                    answer
+                );
+
+                if (result.state === 'ready') {
+                    // Got enough info - show enriched query
+                    this.showEnrichedQueryConfirmation(result.enriched_query, originalTranscript);
+                } else {
+                    // Need more info - show next question
+                    this.showTherapyQuestion(result.question, originalTranscript);
+                }
+            } catch (error: any) {
+                new Notice(`Error: ${error.message}`);
+                answerBtn.disabled = false;
+                answerBtn.setText('Answer');
+            }
+        };
+
+        const skipBtn = btnContainer.createEl('button', { text: 'Skip & Submit' });
+        skipBtn.style.cssText = `
+            padding: 10px 20px;
+            background: var(--background-modifier-border);
+            color: var(--text-normal);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        `;
+        skipBtn.onclick = () => {
+            // Submit original transcript directly
+            this.showEnrichedQueryConfirmation(originalTranscript, originalTranscript);
+        };
+
+        // Update record button to allow voice answer
+        this.recordBtn.setText('VOICE ANSWER');
+        this.recordBtn.disabled = false;
+        this.recordBtn.style.background = 'var(--interactive-accent)';
+    }
+
+    // Show enriched query for final confirmation before submitting
+    showEnrichedQueryConfirmation(enrichedQuery: string, originalTranscript: string) {
+        this.resultEl.empty();
+
+        this.statusEl.setText('Ready to submit to analyst');
+        this.statusEl.style.color = 'var(--text-success)';
+
+        // Show what will be submitted
+        const labelEl = this.resultEl.createEl('p', { text: 'Your research query:' });
+        labelEl.style.cssText = 'font-weight: 500; margin-bottom: 10px;';
+
+        const textarea = this.resultEl.createEl('textarea');
+        textarea.value = enrichedQuery;
+        textarea.style.cssText = `
+            width: 100%;
+            min-height: 80px;
             padding: 10px;
             border-radius: 8px;
             border: 1px solid var(--background-modifier-border);
@@ -2805,9 +3461,9 @@ class VoiceNoteModal extends Modal {
             font-weight: 500;
         `;
         submitBtn.onclick = async () => {
-            const finalText = textarea.value.trim();
-            if (!finalText) {
-                new Notice('Please enter some text');
+            const finalQuery = textarea.value.trim();
+            if (!finalQuery) {
+                new Notice('Please enter a query');
                 return;
             }
 
@@ -2815,12 +3471,15 @@ class VoiceNoteModal extends Modal {
             submitBtn.setText('Submitting...');
 
             try {
-                // Submit to queue
-                await this.plugin.remoteClient?.submitQuery(finalText);
+                // Submit enriched query to coach queue
+                await this.plugin.queueClient?.submitQuery(finalQuery, {
+                    original_transcript: originalTranscript,
+                    therapy_session_id: this.remoteTherapySessionId
+                });
                 new Notice('Query submitted to analyst!');
 
                 // Save to vault
-                await this.saveRemoteVoiceNote(finalText);
+                await this.saveRemoteVoiceNote(originalTranscript + '\n\n---\n\n**Research Query:** ' + finalQuery);
 
                 this.statusEl.setText('Submitted! Your analyst will process this.');
                 this.statusEl.style.color = 'var(--text-success)';
@@ -2828,6 +3487,7 @@ class VoiceNoteModal extends Modal {
                 this.recordBtn.setText('RECORD ANOTHER');
                 this.recordBtn.disabled = false;
                 this.recordBtn.style.background = 'var(--interactive-accent)';
+                this.remoteTherapySessionId = null;
 
             } catch (error: any) {
                 new Notice(`Submit failed: ${error.message}`);
@@ -2846,15 +3506,79 @@ class VoiceNoteModal extends Modal {
             cursor: pointer;
         `;
         saveOnlyBtn.onclick = async () => {
-            const finalText = textarea.value.trim();
-            if (finalText) {
-                await this.saveRemoteVoiceNote(finalText);
-                new Notice('Voice note saved to vault');
-            }
+            await this.saveRemoteVoiceNote(originalTranscript + '\n\n---\n\n**Research Query:** ' + textarea.value);
+            new Notice('Voice note saved to vault');
             this.close();
         };
 
-        // Update record button
+        this.recordBtn.setText('RECORD NEW');
+        this.recordBtn.disabled = false;
+        this.recordBtn.style.background = 'var(--interactive-accent)';
+    }
+
+    // Fallback: direct submit form (if therapy fails)
+    showDirectSubmitForm(transcript: string, usage: any) {
+        this.resultEl.empty();
+
+        this.statusEl.setText('Review your transcription');
+        this.statusEl.style.color = 'var(--text-accent)';
+
+        const textarea = this.resultEl.createEl('textarea');
+        textarea.value = transcript;
+        textarea.style.cssText = `
+            width: 100%;
+            min-height: 100px;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid var(--background-modifier-border);
+            background: var(--background-primary);
+            color: var(--text-normal);
+            font-size: 14px;
+            resize: vertical;
+            margin-bottom: 15px;
+        `;
+
+        const btnContainer = this.resultEl.createDiv();
+        btnContainer.style.cssText = 'display: flex; gap: 10px; justify-content: center;';
+
+        const submitBtn = btnContainer.createEl('button', { text: 'Submit to Analyst' });
+        submitBtn.style.cssText = `
+            padding: 10px 20px;
+            background: var(--interactive-accent);
+            color: var(--text-on-accent);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+        `;
+        submitBtn.onclick = async () => {
+            const finalText = textarea.value.trim();
+            if (!finalText) {
+                new Notice('Please enter some text');
+                return;
+            }
+
+            submitBtn.disabled = true;
+            submitBtn.setText('Submitting...');
+
+            try {
+                await this.plugin.queueClient?.submitQuery(finalText);
+                new Notice('Query submitted to analyst!');
+                await this.saveRemoteVoiceNote(finalText);
+
+                this.statusEl.setText('Submitted! Your analyst will process this.');
+                this.statusEl.style.color = 'var(--text-success)';
+
+                this.recordBtn.setText('RECORD ANOTHER');
+                this.recordBtn.disabled = false;
+                this.recordBtn.style.background = 'var(--interactive-accent)';
+            } catch (error: any) {
+                new Notice(`Submit failed: ${error.message}`);
+                submitBtn.disabled = false;
+                submitBtn.setText('Submit to Analyst');
+            }
+        };
+
         this.recordBtn.setText('RECORD MORE');
         this.recordBtn.disabled = false;
         this.recordBtn.style.background = 'var(--interactive-accent)';
@@ -4195,6 +4919,90 @@ class CoachAddAthleteModal extends Modal {
                         this.close();
                     } catch (error) {
                         new Notice('Failed to add athlete');
+                    }
+                }));
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// Coach Push Concepts Modal - Select athlete to push concepts to
+class CoachPushConceptsModal extends Modal {
+    plugin: BJJFlipmodePlugin;
+    concepts: any[];
+
+    constructor(app: App, plugin: BJJFlipmodePlugin, concepts: any[]) {
+        super(app);
+        this.plugin = plugin;
+        this.concepts = concepts;
+    }
+
+    async onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl('h2', { text: 'Push Concepts to Athlete' });
+        contentEl.createEl('p', { text: `${this.concepts.length} concepts ready to push` });
+
+        // Load athletes
+        let athletes: any[] = [];
+        try {
+            athletes = await this.plugin.coachClient!.getAthletes();
+        } catch {
+            contentEl.createEl('p', { text: 'Failed to load athletes' });
+            return;
+        }
+
+        if (athletes.length === 0) {
+            contentEl.createEl('p', { text: 'No athletes in roster. Add athletes first.' });
+            return;
+        }
+
+        let selectedAthleteId: number | null = null;
+
+        new Setting(contentEl)
+            .setName('Select Athlete')
+            .addDropdown(dropdown => {
+                dropdown.addOption('', 'Choose athlete...');
+                for (const athlete of athletes) {
+                    dropdown.addOption(
+                        String(athlete.id),
+                        athlete.display_name || athlete.discord_username || `Athlete ${athlete.id}`
+                    );
+                }
+                dropdown.onChange(value => {
+                    selectedAthleteId = value ? parseInt(value) : null;
+                });
+            });
+
+        // Concept list preview
+        const listEl = contentEl.createEl('div', { cls: 'concept-list' });
+        listEl.createEl('h4', { text: 'Concepts:' });
+        const ul = listEl.createEl('ul');
+        for (const c of this.concepts.slice(0, 10)) {
+            ul.createEl('li', { text: `${c.name} (${c.category})` });
+        }
+        if (this.concepts.length > 10) {
+            ul.createEl('li', { text: `... and ${this.concepts.length - 10} more` });
+        }
+
+        new Setting(contentEl)
+            .addButton(btn => btn
+                .setButtonText('Push Concepts')
+                .setCta()
+                .onClick(async () => {
+                    if (!selectedAthleteId) {
+                        new Notice('Select an athlete first');
+                        return;
+                    }
+                    try {
+                        new Notice('Pushing concepts...');
+                        const result = await this.plugin.coachClient!.pushConcepts(selectedAthleteId, this.concepts);
+                        new Notice(`Pushed! ${result.created} new, ${result.updated} updated`);
+                        this.close();
+                    } catch (error) {
+                        console.error('Push concepts error:', error);
+                        new Notice('Failed to push concepts');
                     }
                 }));
     }
