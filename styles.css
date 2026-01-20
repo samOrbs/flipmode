@@ -1,0 +1,86 @@
+/* Flipmode Plugin Styles */
+
+.flipmode-modal {
+    max-width: 600px;
+}
+
+.flipmode-modal h2 {
+    margin-bottom: 1em;
+    color: var(--text-accent);
+}
+
+.flipmode-status {
+    padding: 8px 12px;
+    border-radius: 4px;
+    margin-bottom: 1em;
+    font-weight: 500;
+}
+
+.flipmode-status.connected {
+    background-color: rgba(0, 255, 0, 0.1);
+    color: var(--text-success);
+}
+
+.flipmode-status.disconnected {
+    background-color: rgba(255, 0, 0, 0.1);
+    color: var(--text-error);
+}
+
+.flipmode-buttons {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.flipmode-buttons .setting-item {
+    border-top: none;
+    padding-top: 0;
+}
+
+/* Research Modal */
+.flipmode-research-modal {
+    min-width: 500px;
+    max-width: 700px;
+}
+
+.flipmode-research-modal textarea {
+    min-height: 60px;
+    width: 100%;
+}
+
+.flipmode-results {
+    margin-top: 1em;
+    padding: 1em;
+    background-color: var(--background-secondary);
+    border-radius: 4px;
+}
+
+.flipmode-results h3 {
+    margin-top: 0;
+    color: var(--text-accent);
+}
+
+.research-preview {
+    font-size: 0.9em;
+    color: var(--text-muted);
+    margin-bottom: 1em;
+}
+
+.sources-list {
+    font-size: 0.85em;
+    margin: 1em 0;
+    padding-left: 1.5em;
+}
+
+.sources-list li {
+    margin-bottom: 4px;
+}
+
+.flipmode-results .error {
+    color: var(--text-error);
+}
+
+/* Status bar */
+.status-bar-item {
+    font-size: 0.8em;
+}
