@@ -1041,6 +1041,62 @@ This note will be updated when results are ready.
         }
     }
 
+    // Remote transcription for athletes (uses Heroku OpenAI Whisper)
+    async remoteTranscribe(audioBlob: Blob): Promise<{text: string, duration: number, usage: any}> {
+        if (!this.settings.queueServiceUrl || !this.settings.athleteToken) {
+            throw new Error('Remote transcription requires queue service URL and athlete token');
+        }
+
+        // Convert blob to base64 using FileReader (works better on mobile)
+        const base64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                const dataUrl = reader.result as string;
+                // Remove the data:audio/webm;base64, prefix
+                const base64Data = dataUrl.split(',')[1];
+                resolve(base64Data);
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(audioBlob);
+        });
+
+        console.log('[Flipmode] Sending voice note to:', this.settings.queueServiceUrl);
+        console.log('[Flipmode] Audio size:', audioBlob.size, 'bytes, base64 length:', base64.length);
+
+        const response = await requestUrl({
+            url: `${this.settings.queueServiceUrl}/api/voice/transcribe`,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${this.settings.athleteToken}`
+            },
+            body: JSON.stringify({ audio_base64: base64 })
+        });
+
+        if (response.status >= 400) {
+            throw new Error(response.json?.error || 'Transcription failed');
+        }
+
+        return response.json;
+    }
+
+    // Check voice note usage for today
+    async getVoiceUsage(): Promise<{count: number, remaining: number, limit: number}> {
+        if (!this.settings.queueServiceUrl || !this.settings.athleteToken) {
+            throw new Error('Requires queue service URL and athlete token');
+        }
+
+        const response = await requestUrl({
+            url: `${this.settings.queueServiceUrl}/api/voice/usage`,
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${this.settings.athleteToken}`
+            }
+        });
+
+        return response.json;
+    }
+
     async checkConnection(): Promise<boolean> {
         try {
             const response = await this.apiRequest('/health');
@@ -2621,43 +2677,72 @@ class VoiceNoteModal extends Modal {
 
     async processRecording() {
         try {
-            // Convert to base64
             const audioBlob = new Blob(this.audioChunks, { type: 'audio/webm' });
-            const base64 = await this.blobToBase64(audioBlob);
 
-            this.statusEl.setText('Transcribing...');
+            // Check if we're in remote (athlete) mode
+            if (this.plugin.settings.mode === 'remote' && this.plugin.settings.athleteToken) {
+                // REMOTE MODE: Use Heroku transcription
+                this.statusEl.setText('Transcribing via cloud (30s max, 5/day)...');
 
-            let response;
-            if (this.currentSessionId) {
-                // CONTINUE existing session - also needs confirmation
-                response = await this.plugin.respondToSession(
-                    this.currentSessionId,
-                    undefined,  // no text
-                    base64,     // audio
-                    undefined   // no option
-                );
+                try {
+                    const result = await this.plugin.remoteTranscribe(audioBlob);
 
-                // Check if we need confirmation (voice input returns awaiting_confirmation)
-                if (response.awaiting_confirmation) {
-                    // Use this.currentSessionId (already set) for continuation
-                    this.showTranscriptConfirmation(response.transcript, response.message, this.currentSessionId);
-                } else {
-                    this.displayResults(response);
+                    // Show usage info
+                    const usageInfo = `(${result.usage.remaining} voice notes remaining today)`;
+                    this.statusEl.setText(`Transcribed ${Math.round(result.duration)}s ${usageInfo}`);
+
+                    // Show transcript for confirmation before submitting to queue
+                    this.showRemoteTranscriptConfirmation(result.text, result.usage);
+
+                } catch (error: any) {
+                    if (error.message.includes('Daily limit')) {
+                        this.statusEl.setText('Daily voice note limit reached (5/day)');
+                        new Notice('You have used all 5 voice notes for today. Try again tomorrow!');
+                    } else if (error.message.includes('too long')) {
+                        this.statusEl.setText('Recording too long (max 30 seconds)');
+                        new Notice('Voice notes are limited to 30 seconds. Please record a shorter message.');
+                    } else {
+                        throw error;
+                    }
+                    this.recordBtn.setText('TRY AGAIN');
+                    this.recordBtn.disabled = false;
+                    this.recordBtn.style.background = 'var(--interactive-accent)';
+                    return;
                 }
-            } else {
-                // START new session (first recording)
-                response = await this.plugin.startVoiceSession(base64);
 
-                // Check if we need confirmation (Step 1 of 2-step flow)
-                if (response.awaiting_confirmation) {
-                    this.showTranscriptConfirmation(response.transcript, response.message, null);
+            } else {
+                // LOCAL MODE: Use local server transcription
+                const base64 = await this.blobToBase64(audioBlob);
+                this.statusEl.setText('Transcribing...');
+
+                let response;
+                if (this.currentSessionId) {
+                    // CONTINUE existing session
+                    response = await this.plugin.respondToSession(
+                        this.currentSessionId,
+                        undefined,
+                        base64,
+                        undefined
+                    );
+
+                    if (response.awaiting_confirmation) {
+                        this.showTranscriptConfirmation(response.transcript, response.message, this.currentSessionId);
+                    } else {
+                        this.displayResults(response);
+                    }
                 } else {
-                    // Direct response (shouldn't happen with new API, but handle gracefully)
-                    this.displayResults(response);
+                    // START new session
+                    response = await this.plugin.startVoiceSession(base64);
+
+                    if (response.awaiting_confirmation) {
+                        this.showTranscriptConfirmation(response.transcript, response.message, null);
+                    } else {
+                        this.displayResults(response);
+                    }
                 }
             }
 
-        } catch (error) {
+        } catch (error: any) {
             console.error('Processing error:', error);
             this.statusEl.setText('Error processing recording');
             this.statusEl.style.color = 'var(--text-error)';
@@ -2671,6 +2756,131 @@ class VoiceNoteModal extends Modal {
                 cls: 'error'
             });
         }
+    }
+
+    // Show transcript confirmation for remote (athlete) mode
+    showRemoteTranscriptConfirmation(transcript: string, usage: any) {
+        this.resultEl.empty();
+
+        this.statusEl.setText('Review your transcription');
+        this.statusEl.style.color = 'var(--text-accent)';
+
+        // Usage info
+        const usageEl = this.resultEl.createEl('p', {
+            text: `Voice notes today: ${usage.count}/${usage.limit} (${usage.remaining} remaining)`
+        });
+        usageEl.style.textAlign = 'center';
+        usageEl.style.color = 'var(--text-muted)';
+        usageEl.style.fontSize = '0.85em';
+        usageEl.style.marginBottom = '10px';
+
+        // Editable transcript
+        const textarea = this.resultEl.createEl('textarea');
+        textarea.value = transcript;
+        textarea.style.cssText = `
+            width: 100%;
+            min-height: 100px;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid var(--background-modifier-border);
+            background: var(--background-primary);
+            color: var(--text-normal);
+            font-size: 14px;
+            resize: vertical;
+            margin-bottom: 15px;
+        `;
+
+        // Buttons
+        const btnContainer = this.resultEl.createDiv();
+        btnContainer.style.cssText = 'display: flex; gap: 10px; justify-content: center;';
+
+        const submitBtn = btnContainer.createEl('button', { text: 'Submit to Analyst' });
+        submitBtn.style.cssText = `
+            padding: 10px 20px;
+            background: var(--interactive-accent);
+            color: var(--text-on-accent);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+        `;
+        submitBtn.onclick = async () => {
+            const finalText = textarea.value.trim();
+            if (!finalText) {
+                new Notice('Please enter some text');
+                return;
+            }
+
+            submitBtn.disabled = true;
+            submitBtn.setText('Submitting...');
+
+            try {
+                // Submit to queue
+                await this.plugin.remoteClient?.submitQuery(finalText);
+                new Notice('Query submitted to analyst!');
+
+                // Save to vault
+                await this.saveRemoteVoiceNote(finalText);
+
+                this.statusEl.setText('Submitted! Your analyst will process this.');
+                this.statusEl.style.color = 'var(--text-success)';
+
+                this.recordBtn.setText('RECORD ANOTHER');
+                this.recordBtn.disabled = false;
+                this.recordBtn.style.background = 'var(--interactive-accent)';
+
+            } catch (error: any) {
+                new Notice(`Submit failed: ${error.message}`);
+                submitBtn.disabled = false;
+                submitBtn.setText('Submit to Analyst');
+            }
+        };
+
+        const saveOnlyBtn = btnContainer.createEl('button', { text: 'Save Only' });
+        saveOnlyBtn.style.cssText = `
+            padding: 10px 20px;
+            background: var(--background-modifier-border);
+            color: var(--text-normal);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        `;
+        saveOnlyBtn.onclick = async () => {
+            const finalText = textarea.value.trim();
+            if (finalText) {
+                await this.saveRemoteVoiceNote(finalText);
+                new Notice('Voice note saved to vault');
+            }
+            this.close();
+        };
+
+        // Update record button
+        this.recordBtn.setText('RECORD MORE');
+        this.recordBtn.disabled = false;
+        this.recordBtn.style.background = 'var(--interactive-accent)';
+    }
+
+    // Save voice note to vault (for remote mode)
+    async saveRemoteVoiceNote(transcript: string) {
+        const date = new Date().toISOString().split('T')[0];
+        const time = new Date().toTimeString().split(' ')[0].replace(/:/g, '-');
+        const folder = this.plugin.settings.syncFolder + '/VoiceNotes';
+
+        await this.plugin.ensureFoldersExist([folder]);
+
+        const content = `---
+type: voice-note
+date: ${date}
+tags: [bjj, voice-note]
+---
+
+# Voice Note - ${date} ${time}
+
+${transcript}
+`;
+
+        const fileName = `${folder}/Voice Note ${date} ${time}.md`;
+        await this.app.vault.create(fileName, content);
     }
 
     showTranscriptConfirmation(transcript: string, message: string, sessionIdForContinuation: string | null) {

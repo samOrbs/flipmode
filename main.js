@@ -845,6 +845,52 @@ This note will be updated when results are ready.
       throw error;
     }
   }
+  // Remote transcription for athletes (uses Heroku OpenAI Whisper)
+  async remoteTranscribe(audioBlob) {
+    var _a;
+    if (!this.settings.queueServiceUrl || !this.settings.athleteToken) {
+      throw new Error("Remote transcription requires queue service URL and athlete token");
+    }
+    const base64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const dataUrl = reader.result;
+        const base64Data = dataUrl.split(",")[1];
+        resolve(base64Data);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(audioBlob);
+    });
+    console.log("[Flipmode] Sending voice note to:", this.settings.queueServiceUrl);
+    console.log("[Flipmode] Audio size:", audioBlob.size, "bytes, base64 length:", base64.length);
+    const response = await (0, import_obsidian.requestUrl)({
+      url: `${this.settings.queueServiceUrl}/api/voice/transcribe`,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.settings.athleteToken}`
+      },
+      body: JSON.stringify({ audio_base64: base64 })
+    });
+    if (response.status >= 400) {
+      throw new Error(((_a = response.json) == null ? void 0 : _a.error) || "Transcription failed");
+    }
+    return response.json;
+  }
+  // Check voice note usage for today
+  async getVoiceUsage() {
+    if (!this.settings.queueServiceUrl || !this.settings.athleteToken) {
+      throw new Error("Requires queue service URL and athlete token");
+    }
+    const response = await (0, import_obsidian.requestUrl)({
+      url: `${this.settings.queueServiceUrl}/api/voice/usage`,
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${this.settings.athleteToken}`
+      }
+    });
+    return response.json;
+  }
   async checkConnection() {
     try {
       const response = await this.apiRequest("/health");
@@ -2072,30 +2118,51 @@ var VoiceNoteModal = class extends import_obsidian.Modal {
   async processRecording() {
     try {
       const audioBlob = new Blob(this.audioChunks, { type: "audio/webm" });
-      const base64 = await this.blobToBase64(audioBlob);
-      this.statusEl.setText("Transcribing...");
-      let response;
-      if (this.currentSessionId) {
-        response = await this.plugin.respondToSession(
-          this.currentSessionId,
-          void 0,
-          // no text
-          base64,
-          // audio
-          void 0
-          // no option
-        );
-        if (response.awaiting_confirmation) {
-          this.showTranscriptConfirmation(response.transcript, response.message, this.currentSessionId);
-        } else {
-          this.displayResults(response);
+      if (this.plugin.settings.mode === "remote" && this.plugin.settings.athleteToken) {
+        this.statusEl.setText("Transcribing via cloud (30s max, 5/day)...");
+        try {
+          const result = await this.plugin.remoteTranscribe(audioBlob);
+          const usageInfo = `(${result.usage.remaining} voice notes remaining today)`;
+          this.statusEl.setText(`Transcribed ${Math.round(result.duration)}s ${usageInfo}`);
+          this.showRemoteTranscriptConfirmation(result.text, result.usage);
+        } catch (error) {
+          if (error.message.includes("Daily limit")) {
+            this.statusEl.setText("Daily voice note limit reached (5/day)");
+            new import_obsidian.Notice("You have used all 5 voice notes for today. Try again tomorrow!");
+          } else if (error.message.includes("too long")) {
+            this.statusEl.setText("Recording too long (max 30 seconds)");
+            new import_obsidian.Notice("Voice notes are limited to 30 seconds. Please record a shorter message.");
+          } else {
+            throw error;
+          }
+          this.recordBtn.setText("TRY AGAIN");
+          this.recordBtn.disabled = false;
+          this.recordBtn.style.background = "var(--interactive-accent)";
+          return;
         }
       } else {
-        response = await this.plugin.startVoiceSession(base64);
-        if (response.awaiting_confirmation) {
-          this.showTranscriptConfirmation(response.transcript, response.message, null);
+        const base64 = await this.blobToBase64(audioBlob);
+        this.statusEl.setText("Transcribing...");
+        let response;
+        if (this.currentSessionId) {
+          response = await this.plugin.respondToSession(
+            this.currentSessionId,
+            void 0,
+            base64,
+            void 0
+          );
+          if (response.awaiting_confirmation) {
+            this.showTranscriptConfirmation(response.transcript, response.message, this.currentSessionId);
+          } else {
+            this.displayResults(response);
+          }
         } else {
-          this.displayResults(response);
+          response = await this.plugin.startVoiceSession(base64);
+          if (response.awaiting_confirmation) {
+            this.showTranscriptConfirmation(response.transcript, response.message, null);
+          } else {
+            this.displayResults(response);
+          }
         }
       }
     } catch (error) {
@@ -2111,6 +2178,108 @@ var VoiceNoteModal = class extends import_obsidian.Modal {
         cls: "error"
       });
     }
+  }
+  // Show transcript confirmation for remote (athlete) mode
+  showRemoteTranscriptConfirmation(transcript, usage) {
+    this.resultEl.empty();
+    this.statusEl.setText("Review your transcription");
+    this.statusEl.style.color = "var(--text-accent)";
+    const usageEl = this.resultEl.createEl("p", {
+      text: `Voice notes today: ${usage.count}/${usage.limit} (${usage.remaining} remaining)`
+    });
+    usageEl.style.textAlign = "center";
+    usageEl.style.color = "var(--text-muted)";
+    usageEl.style.fontSize = "0.85em";
+    usageEl.style.marginBottom = "10px";
+    const textarea = this.resultEl.createEl("textarea");
+    textarea.value = transcript;
+    textarea.style.cssText = `
+            width: 100%;
+            min-height: 100px;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid var(--background-modifier-border);
+            background: var(--background-primary);
+            color: var(--text-normal);
+            font-size: 14px;
+            resize: vertical;
+            margin-bottom: 15px;
+        `;
+    const btnContainer = this.resultEl.createDiv();
+    btnContainer.style.cssText = "display: flex; gap: 10px; justify-content: center;";
+    const submitBtn = btnContainer.createEl("button", { text: "Submit to Analyst" });
+    submitBtn.style.cssText = `
+            padding: 10px 20px;
+            background: var(--interactive-accent);
+            color: var(--text-on-accent);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+        `;
+    submitBtn.onclick = async () => {
+      var _a;
+      const finalText = textarea.value.trim();
+      if (!finalText) {
+        new import_obsidian.Notice("Please enter some text");
+        return;
+      }
+      submitBtn.disabled = true;
+      submitBtn.setText("Submitting...");
+      try {
+        await ((_a = this.plugin.remoteClient) == null ? void 0 : _a.submitQuery(finalText));
+        new import_obsidian.Notice("Query submitted to analyst!");
+        await this.saveRemoteVoiceNote(finalText);
+        this.statusEl.setText("Submitted! Your analyst will process this.");
+        this.statusEl.style.color = "var(--text-success)";
+        this.recordBtn.setText("RECORD ANOTHER");
+        this.recordBtn.disabled = false;
+        this.recordBtn.style.background = "var(--interactive-accent)";
+      } catch (error) {
+        new import_obsidian.Notice(`Submit failed: ${error.message}`);
+        submitBtn.disabled = false;
+        submitBtn.setText("Submit to Analyst");
+      }
+    };
+    const saveOnlyBtn = btnContainer.createEl("button", { text: "Save Only" });
+    saveOnlyBtn.style.cssText = `
+            padding: 10px 20px;
+            background: var(--background-modifier-border);
+            color: var(--text-normal);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        `;
+    saveOnlyBtn.onclick = async () => {
+      const finalText = textarea.value.trim();
+      if (finalText) {
+        await this.saveRemoteVoiceNote(finalText);
+        new import_obsidian.Notice("Voice note saved to vault");
+      }
+      this.close();
+    };
+    this.recordBtn.setText("RECORD MORE");
+    this.recordBtn.disabled = false;
+    this.recordBtn.style.background = "var(--interactive-accent)";
+  }
+  // Save voice note to vault (for remote mode)
+  async saveRemoteVoiceNote(transcript) {
+    const date = new Date().toISOString().split("T")[0];
+    const time = new Date().toTimeString().split(" ")[0].replace(/:/g, "-");
+    const folder = this.plugin.settings.syncFolder + "/VoiceNotes";
+    await this.plugin.ensureFoldersExist([folder]);
+    const content = `---
+type: voice-note
+date: ${date}
+tags: [bjj, voice-note]
+---
+
+# Voice Note - ${date} ${time}
+
+${transcript}
+`;
+    const fileName = `${folder}/Voice Note ${date} ${time}.md`;
+    await this.app.vault.create(fileName, content);
   }
   showTranscriptConfirmation(transcript, message, sessionIdForContinuation) {
     this.resultEl.empty();
