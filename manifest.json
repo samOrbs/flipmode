@@ -1,9 +1,9 @@
 {
   "id": "flipmode",
   "name": "Flipmode",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "minAppVersion": "0.15.0",
-  "description": "AI-powered BJJ coaching and research integration. Connect to your Flipmode server for personalized technique research, training plans, and session notes.",
+  "description": "BJJ coaching and research integration. Concept graphs, training drills, and knowledge management - all derived from your own video library via RLM.",
   "author": "Flipmode",
   "authorUrl": "https://github.com/flipmode",
   "isDesktopOnly": false

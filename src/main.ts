@@ -478,6 +478,24 @@ export default class BJJFlipmodePlugin extends Plugin {
             })
         );
 
+        // Right-click menu on files in file explorer
+        this.registerEvent(
+            this.app.workspace.on('file-menu', (menu: Menu, file: TFile) => {
+                // Only show for markdown files
+                if (!(file instanceof TFile) || file.extension !== 'md') return;
+
+                // Add "Get Training Drills" option for concept files
+                menu.addItem((item) => {
+                    item
+                        .setTitle('Get Training Drills')
+                        .setIcon('dumbbell')
+                        .onClick(async () => {
+                            await this.getTrainingDrillsForConcept(file);
+                        });
+                });
+            })
+        );
+
         // Check connection on startup
         this.checkConnection();
 
@@ -2102,6 +2120,15 @@ ${deepDiveContent}
             return;
         }
 
+        // Get source file's RLM session for concept enrichment later
+        const sourceContent = await this.app.vault.read(file);
+        const frontmatterMatch = sourceContent.match(/^---\n([\s\S]*?)\n---/);
+        let sourceRlmSessionId = '';
+        if (frontmatterMatch) {
+            const sessionMatch = frontmatterMatch[1].match(/rlm_session_id:\s*"([^"]+)"/);
+            if (sessionMatch) sourceRlmSessionId = sessionMatch[1];
+        }
+
         new Notice('Exploding to concept graph...', 3000);
 
         try {
@@ -2155,15 +2182,22 @@ ${deepDiveContent}
                 const counterLinks = (concept.counters || []).map((c: string) => `- [[${c}]]`).join('\n') || '- None';
                 const relatedLinks = (concept.related || []).map((r: string) => `- [[${r}]]`).join('\n') || '- None';
 
+                // Build hierarchical tags based on tier
+                const tier = concept.tier || 'tier3';
+                const tierTag = tier === 'title' ? 'priority/title' : `priority/${tier}`;
+
                 const conceptContent = `---
 type: concept
+tier: "${tier}"
 parent: "${concept.parent || ''}"
-tags: [concept, bjj, ${concept.category?.toLowerCase() || 'technique'}]
+tags: [concept, bjj, ${concept.category?.toLowerCase() || 'technique'}, ${tierTag}]
+source_file: "${file.basename}"
+source_rlm_session: "${sourceRlmSessionId}"
 ---
 
 # ${concept.name}
 
-**Category:** ${concept.category || 'Technique'}
+**Category:** ${concept.category || 'Technique'}  |  **Priority:** ${tier === 'title' ? '🎯 Title Concept' : tier === 'tier1' ? '🔴 Tier 1 - Critical' : tier === 'tier2' ? '🟡 Tier 2 - Important' : '🟢 Tier 3 - Supporting'}
 **Parent:** ${parentLink}
 
 ## Summary
@@ -2191,11 +2225,237 @@ ${relatedLinks}
                 createdCount++;
             }
 
-            new Notice(`Created ${createdCount} concept nodes! Open Graph View to explore.`, 5000);
+            // Create stub files for all linked concepts that don't exist yet
+            // Track detailed relationship context for each linked concept
+            interface LinkedContext {
+                isPrerequisiteFor: string[];
+                leadsTo: string[];
+                counters: string[];
+                counteredBy: string[];
+                relatedTo: string[];
+                parentOf: string[];
+                childOf: string[];
+            }
+            const linkedConceptContext: Map<string, LinkedContext> = new Map();
+
+            const getContext = (name: string): LinkedContext => {
+                if (!linkedConceptContext.has(name)) {
+                    linkedConceptContext.set(name, {
+                        isPrerequisiteFor: [], leadsTo: [], counters: [],
+                        counteredBy: [], relatedTo: [], parentOf: [], childOf: []
+                    });
+                }
+                return linkedConceptContext.get(name)!;
+            };
+
+            for (const concept of concepts) {
+                // Parent relationship
+                if (concept.parent) {
+                    getContext(concept.parent).parentOf.push(concept.name);
+                }
+                // Prerequisites - the prereq enables this concept
+                for (const p of concept.prerequisites || []) {
+                    getContext(p).leadsTo.push(concept.name);
+                    getContext(p).isPrerequisiteFor.push(concept.name);
+                }
+                // Leads to - this concept enables those
+                for (const l of concept.leads_to || []) {
+                    getContext(l).childOf.push(concept.name);
+                }
+                // Counters - bidirectional
+                for (const c of concept.counters || []) {
+                    getContext(c).counteredBy.push(concept.name);
+                }
+                // Related
+                for (const r of concept.related || []) {
+                    getContext(r).relatedTo.push(concept.name);
+                }
+            }
+
+            // Remove concepts we already created
+            for (const concept of concepts) {
+                linkedConceptContext.delete(concept.name);
+            }
+
+            // Create stubs for remaining linked concepts with full context
+            let stubCount = 0;
+            for (const [linkedName, ctx] of linkedConceptContext) {
+                const safeName = linkedName.replace(/[^\w\s-]/g, '').trim();
+                const stubPath = `${conceptsFolder}/${safeName}.md`;
+
+                // Skip if already exists
+                if (this.app.vault.getAbstractFileByPath(stubPath)) continue;
+
+                // Build sections with actual content
+                // Build sections - only include what we actually know from the graph
+                const prerequisitesSection = ctx.isPrerequisiteFor.length > 0
+                    ? ctx.isPrerequisiteFor.map(c => `- [[${c}]]`).join('\n')
+                    : '- *Not yet documented - research via Oracle*';
+
+                const leadsToSection = ctx.leadsTo.length > 0
+                    ? ctx.leadsTo.map(c => `- [[${c}]]`).join('\n')
+                    : '- *Not yet documented - research via Oracle*';
+
+                const countersSection = ctx.counteredBy.length > 0
+                    ? ctx.counteredBy.map(c => `- [[${c}]]`).join('\n')
+                    : '- *Not yet documented - research via Oracle*';
+
+                const relatedSection = [
+                    ...ctx.relatedTo.map(c => `- [[${c}]]`),
+                    ...ctx.parentOf.map(c => `- [[${c}]]`),
+                    ...ctx.childOf.map(c => `- [[${c}]]`)
+                ].join('\n') || '- *Not yet documented*';
+
+                const stubContent = `---
+type: concept
+tier: "stub"
+tags: [concept, bjj, stub, priority/tier3]
+source_file: "${file.basename}"
+source_rlm_session: "${sourceRlmSessionId}"
+---
+
+# ${linkedName}
+
+> [!info] Research This Concept
+> Use Oracle to research "${linkedName}" and expand this node with real content from your video library.
+
+## Summary
+
+*Research this concept via Oracle to add summary from your instructional content.*
+
+## Prerequisites
+
+${prerequisitesSection}
+
+## Leads To
+
+${leadsToSection}
+
+## Counters
+
+${countersSection}
+
+## Related Concepts
+
+${relatedSection}
+
+## Training Drills
+
+*Right-click → "Get Training Drills" to search your video library for exercises.*
+`;
+                await this.app.vault.create(stubPath, stubContent);
+                stubCount++;
+            }
+
+            const totalCreated = createdCount + stubCount;
+            new Notice(`Created ${createdCount} concepts + ${stubCount} linked stubs! Open Graph View.`, 5000);
 
         } catch (error) {
             console.error('Explode to Concept Graph error:', error);
             new Notice('Failed to explode concepts. Check console.', 5000);
+        }
+    }
+
+    // Get training drills and games for a concept node
+    // Uses RLM deep dive to search video library, falls back to AI-generated suggestions
+    async getTrainingDrillsForConcept(file: TFile) {
+        // Read concept file
+        const content = await this.app.vault.read(file);
+        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+
+        if (!frontmatterMatch) {
+            new Notice('No frontmatter found. Is this a concept file?');
+            return;
+        }
+
+        const frontmatter = frontmatterMatch[1];
+
+        // Check if this is a concept file
+        if (!frontmatter.includes('type: concept')) {
+            new Notice('This command only works on concept files');
+            return;
+        }
+
+        // Check if already has drills
+        if (frontmatter.includes('has-drills')) {
+            new Notice('This concept already has training drills');
+            return;
+        }
+
+        // Extract concept info
+        const conceptName = file.basename;
+        const summaryMatch = content.match(/## Summary\n\n([^\n#]+)/);
+        const conceptSummary = summaryMatch ? summaryMatch[1].trim() : conceptName;
+
+        // Get source RLM session if available
+        const sessionMatch = frontmatter.match(/source_rlm_session:\s*"([^"]+)"/);
+        const rlmSessionId = sessionMatch ? sessionMatch[1] : '';
+
+        new Notice(`Finding training drills for: ${conceptName}...`, 3000);
+
+        try {
+            // Call server endpoint to get training drills
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/concept-drills`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify({
+                    concept_name: conceptName,
+                    concept_summary: conceptSummary,
+                    rlm_session_id: rlmSessionId
+                })
+            });
+
+            const result = response.json;
+
+            if (result.error) {
+                new Notice(`Failed to get drills: ${result.error}`, 5000);
+                return;
+            }
+
+            const drills = result.drills || result.content || 'No drills found.';
+            const sourcesCount = result.sources_count || 0;
+            const isGenerated = result.ai_generated || false;
+
+            // Add has-drills tag to frontmatter
+            const updatedFrontmatter = frontmatter.replace(
+                /tags: \[([^\]]+)\]/,
+                'tags: [$1, has-drills]'
+            );
+
+            // Build drills section
+            const timestamp = new Date().toLocaleTimeString();
+            const sourceNote = isGenerated
+                ? '*(AI-generated suggestions)*'
+                : `*(${sourcesCount} sources from video library)*`;
+
+            const drillsSection = `
+
+---
+## Training Drills & Games
+*Generated at ${timestamp}* ${sourceNote}
+
+${drills}
+`;
+
+            // Update file with new frontmatter and drills section
+            const updatedContent = content
+                .replace(frontmatterMatch[0], `---\n${updatedFrontmatter}\n---`)
+                + drillsSection;
+
+            await this.app.vault.modify(file, updatedContent);
+
+            const noticeText = isGenerated
+                ? `Generated training suggestions for: ${conceptName}`
+                : `Found ${sourcesCount} training drills for: ${conceptName}`;
+            new Notice(noticeText, 5000);
+
+        } catch (error) {
+            console.error('Get Training Drills error:', error);
+            new Notice('Failed to get training drills. Check console.', 5000);
         }
     }
 

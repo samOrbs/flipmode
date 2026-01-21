@@ -399,6 +399,17 @@ var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
         }
       })
     );
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, file) => {
+        if (!(file instanceof import_obsidian.TFile) || file.extension !== "md")
+          return;
+        menu.addItem((item) => {
+          item.setTitle("Get Training Drills").setIcon("dumbbell").onClick(async () => {
+            await this.getTrainingDrillsForConcept(file);
+          });
+        });
+      })
+    );
     this.checkConnection();
     if (this.settings.autoSync) {
       this.startAutoSync();
@@ -1698,6 +1709,14 @@ ${deepDiveContent}
       new import_obsidian.Notice("Select more text to explode (at least a paragraph)");
       return;
     }
+    const sourceContent = await this.app.vault.read(file);
+    const frontmatterMatch = sourceContent.match(/^---\n([\s\S]*?)\n---/);
+    let sourceRlmSessionId = "";
+    if (frontmatterMatch) {
+      const sessionMatch = frontmatterMatch[1].match(/rlm_session_id:\s*"([^"]+)"/);
+      if (sessionMatch)
+        sourceRlmSessionId = sessionMatch[1];
+    }
     new import_obsidian.Notice("Exploding to concept graph...", 3e3);
     try {
       const response = await (0, import_obsidian.requestUrl)({
@@ -1737,15 +1756,20 @@ ${deepDiveContent}
         const leadsToLinks = (concept.leads_to || []).map((l) => `- [[${l}]]`).join("\n") || "- None";
         const counterLinks = (concept.counters || []).map((c) => `- [[${c}]]`).join("\n") || "- None";
         const relatedLinks = (concept.related || []).map((r) => `- [[${r}]]`).join("\n") || "- None";
+        const tier = concept.tier || "tier3";
+        const tierTag = tier === "title" ? "priority/title" : `priority/${tier}`;
         const conceptContent = `---
 type: concept
+tier: "${tier}"
 parent: "${concept.parent || ""}"
-tags: [concept, bjj, ${((_a = concept.category) == null ? void 0 : _a.toLowerCase()) || "technique"}]
+tags: [concept, bjj, ${((_a = concept.category) == null ? void 0 : _a.toLowerCase()) || "technique"}, ${tierTag}]
+source_file: "${file.basename}"
+source_rlm_session: "${sourceRlmSessionId}"
 ---
 
 # ${concept.name}
 
-**Category:** ${concept.category || "Technique"}
+**Category:** ${concept.category || "Technique"}  |  **Priority:** ${tier === "title" ? "\u{1F3AF} Title Concept" : tier === "tier1" ? "\u{1F534} Tier 1 - Critical" : tier === "tier2" ? "\u{1F7E1} Tier 2 - Important" : "\u{1F7E2} Tier 3 - Supporting"}
 **Parent:** ${parentLink}
 
 ## Summary
@@ -1771,10 +1795,172 @@ ${relatedLinks}
         await this.app.vault.create(conceptPath, conceptContent);
         createdCount++;
       }
-      new import_obsidian.Notice(`Created ${createdCount} concept nodes! Open Graph View to explore.`, 5e3);
+      const linkedConceptContext = /* @__PURE__ */ new Map();
+      const getContext = (name) => {
+        if (!linkedConceptContext.has(name)) {
+          linkedConceptContext.set(name, {
+            isPrerequisiteFor: [],
+            leadsTo: [],
+            counters: [],
+            counteredBy: [],
+            relatedTo: [],
+            parentOf: [],
+            childOf: []
+          });
+        }
+        return linkedConceptContext.get(name);
+      };
+      for (const concept of concepts) {
+        if (concept.parent) {
+          getContext(concept.parent).parentOf.push(concept.name);
+        }
+        for (const p of concept.prerequisites || []) {
+          getContext(p).leadsTo.push(concept.name);
+          getContext(p).isPrerequisiteFor.push(concept.name);
+        }
+        for (const l of concept.leads_to || []) {
+          getContext(l).childOf.push(concept.name);
+        }
+        for (const c of concept.counters || []) {
+          getContext(c).counteredBy.push(concept.name);
+        }
+        for (const r of concept.related || []) {
+          getContext(r).relatedTo.push(concept.name);
+        }
+      }
+      for (const concept of concepts) {
+        linkedConceptContext.delete(concept.name);
+      }
+      let stubCount = 0;
+      for (const [linkedName, ctx] of linkedConceptContext) {
+        const safeName = linkedName.replace(/[^\w\s-]/g, "").trim();
+        const stubPath = `${conceptsFolder}/${safeName}.md`;
+        if (this.app.vault.getAbstractFileByPath(stubPath))
+          continue;
+        const prerequisitesSection = ctx.isPrerequisiteFor.length > 0 ? ctx.isPrerequisiteFor.map((c) => `- [[${c}]]`).join("\n") : "- *Not yet documented - research via Oracle*";
+        const leadsToSection = ctx.leadsTo.length > 0 ? ctx.leadsTo.map((c) => `- [[${c}]]`).join("\n") : "- *Not yet documented - research via Oracle*";
+        const countersSection = ctx.counteredBy.length > 0 ? ctx.counteredBy.map((c) => `- [[${c}]]`).join("\n") : "- *Not yet documented - research via Oracle*";
+        const relatedSection = [
+          ...ctx.relatedTo.map((c) => `- [[${c}]]`),
+          ...ctx.parentOf.map((c) => `- [[${c}]]`),
+          ...ctx.childOf.map((c) => `- [[${c}]]`)
+        ].join("\n") || "- *Not yet documented*";
+        const stubContent = `---
+type: concept
+tier: "stub"
+tags: [concept, bjj, stub, priority/tier3]
+source_file: "${file.basename}"
+source_rlm_session: "${sourceRlmSessionId}"
+---
+
+# ${linkedName}
+
+> [!info] Research This Concept
+> Use Oracle to research "${linkedName}" and expand this node with real content from your video library.
+
+## Summary
+
+*Research this concept via Oracle to add summary from your instructional content.*
+
+## Prerequisites
+
+${prerequisitesSection}
+
+## Leads To
+
+${leadsToSection}
+
+## Counters
+
+${countersSection}
+
+## Related Concepts
+
+${relatedSection}
+
+## Training Drills
+
+*Right-click \u2192 "Get Training Drills" to search your video library for exercises.*
+`;
+        await this.app.vault.create(stubPath, stubContent);
+        stubCount++;
+      }
+      const totalCreated = createdCount + stubCount;
+      new import_obsidian.Notice(`Created ${createdCount} concepts + ${stubCount} linked stubs! Open Graph View.`, 5e3);
     } catch (error) {
       console.error("Explode to Concept Graph error:", error);
       new import_obsidian.Notice("Failed to explode concepts. Check console.", 5e3);
+    }
+  }
+  // Get training drills and games for a concept node
+  // Uses RLM deep dive to search video library, falls back to AI-generated suggestions
+  async getTrainingDrillsForConcept(file) {
+    const content = await this.app.vault.read(file);
+    const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!frontmatterMatch) {
+      new import_obsidian.Notice("No frontmatter found. Is this a concept file?");
+      return;
+    }
+    const frontmatter = frontmatterMatch[1];
+    if (!frontmatter.includes("type: concept")) {
+      new import_obsidian.Notice("This command only works on concept files");
+      return;
+    }
+    if (frontmatter.includes("has-drills")) {
+      new import_obsidian.Notice("This concept already has training drills");
+      return;
+    }
+    const conceptName = file.basename;
+    const summaryMatch = content.match(/## Summary\n\n([^\n#]+)/);
+    const conceptSummary = summaryMatch ? summaryMatch[1].trim() : conceptName;
+    const sessionMatch = frontmatter.match(/source_rlm_session:\s*"([^"]+)"/);
+    const rlmSessionId = sessionMatch ? sessionMatch[1] : "";
+    new import_obsidian.Notice(`Finding training drills for: ${conceptName}...`, 3e3);
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/concept-drills`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify({
+          concept_name: conceptName,
+          concept_summary: conceptSummary,
+          rlm_session_id: rlmSessionId
+        })
+      });
+      const result = response.json;
+      if (result.error) {
+        new import_obsidian.Notice(`Failed to get drills: ${result.error}`, 5e3);
+        return;
+      }
+      const drills = result.drills || result.content || "No drills found.";
+      const sourcesCount = result.sources_count || 0;
+      const isGenerated = result.ai_generated || false;
+      const updatedFrontmatter = frontmatter.replace(
+        /tags: \[([^\]]+)\]/,
+        "tags: [$1, has-drills]"
+      );
+      const timestamp = new Date().toLocaleTimeString();
+      const sourceNote = isGenerated ? "*(AI-generated suggestions)*" : `*(${sourcesCount} sources from video library)*`;
+      const drillsSection = `
+
+---
+## Training Drills & Games
+*Generated at ${timestamp}* ${sourceNote}
+
+${drills}
+`;
+      const updatedContent = content.replace(frontmatterMatch[0], `---
+${updatedFrontmatter}
+---`) + drillsSection;
+      await this.app.vault.modify(file, updatedContent);
+      const noticeText = isGenerated ? `Generated training suggestions for: ${conceptName}` : `Found ${sourcesCount} training drills for: ${conceptName}`;
+      new import_obsidian.Notice(noticeText, 5e3);
+    } catch (error) {
+      console.error("Get Training Drills error:", error);
+      new import_obsidian.Notice("Failed to get training drills. Check console.", 5e3);
     }
   }
   // Generate Skill Development sessions from selected text (right-click context menu)
