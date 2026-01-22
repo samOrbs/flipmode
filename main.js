@@ -51,7 +51,9 @@ var DEFAULT_SETTINGS = {
   currentSeason: 1,
   currentEpisode: 1,
   // Athlete identity
-  athleteName: "Athlete"
+  athleteName: "Athlete",
+  // Concepts folder structure
+  conceptsSubfolder: "concepts"
 };
 var RemoteQueueClient = class {
   constructor(baseUrl, token) {
@@ -250,6 +252,23 @@ var CoachQueueClient = class {
     });
     return response.json;
   }
+  async shareConceptGraph(athleteId, conceptName, conceptSummary, graphData) {
+    const response = await (0, import_obsidian.requestUrl)({
+      url: `${this.baseUrl}/api/coach/share-concept-graph`,
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${this.token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        athlete_id: athleteId,
+        concept_name: conceptName,
+        concept_summary: conceptSummary,
+        graph_data: graphData
+      })
+    });
+    return response.json;
+  }
 };
 var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
   constructor() {
@@ -268,6 +287,12 @@ var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
     this.updateStatusBar("Disconnected");
     this.addRibbonIcon("brain-circuit", "Flipmode", async () => {
       await this.showFlipmodeMenu();
+    });
+    this.registerObsidianProtocolHandler("flipmode-sync", async (params) => {
+      const conceptName = params.concept;
+      if (conceptName) {
+        await this.syncAndOpenConcept(conceptName);
+      }
     });
     this.addCommand({
       id: "flipmode-voice-note",
@@ -366,9 +391,37 @@ var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
     });
     this.addCommand({
       id: "flipmode-sync-from-coach",
-      name: "Sync from Coach (fetch completed research)",
+      name: "Sync from Oracle (fetch completed research)",
       callback: async () => {
         await this.syncFromCoach();
+      }
+    });
+    this.addCommand({
+      id: "flipmode-find-video-canvas",
+      name: "Find Video for Selected Concept (Canvas)",
+      checkCallback: (checking) => {
+        const canvasView = this.app.workspace.getActiveViewOfType(import_obsidian.ItemView);
+        if (canvasView && canvasView.getViewType() === "canvas") {
+          if (!checking) {
+            this.findVideoForCanvasNode(canvasView);
+          }
+          return true;
+        }
+        return false;
+      }
+    });
+    this.addCommand({
+      id: "flipmode-rlm-pipeline",
+      name: "RLM: Enrich & Rebuild Canvas",
+      checkCallback: (checking) => {
+        const canvasView = this.app.workspace.getActiveViewOfType(import_obsidian.ItemView);
+        if (canvasView && canvasView.getViewType() === "canvas") {
+          if (!checking) {
+            this.runRLMPipeline(canvasView);
+          }
+          return true;
+        }
+        return false;
       }
     });
     this.addSettingTab(new BJJFlipmodeSettingTab(this.app, this));
@@ -400,14 +453,96 @@ var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
       })
     );
     this.registerEvent(
+      this.app.workspace.on("canvas:node-menu", (menu, node) => {
+        var _a, _b, _c;
+        let hasLinkedSources = false;
+        let sessionId = null;
+        if (node.file) {
+          const cache = this.app.metadataCache.getFileCache(node.file);
+          if ((_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.source_rlm_session) {
+            hasLinkedSources = true;
+            sessionId = cache.frontmatter.source_rlm_session;
+          }
+        }
+        if (hasLinkedSources && sessionId) {
+          menu.addItem((item) => {
+            item.setTitle("View Source Videos").setIcon("library").onClick(async () => {
+              await this.showArticleBibliography(node, sessionId);
+            });
+          });
+        }
+        menu.addItem((item) => {
+          item.setTitle("Search Videos (Semantic)").setIcon("search").onClick(async () => {
+            await this.findVideoForCanvasNodeDirect(node);
+          });
+        });
+        menu.addItem((item) => {
+          item.setTitle("Explore Full Series").setIcon("layers").onClick(async () => {
+            await this.exploreSeriesForCanvasNode(node);
+          });
+        });
+        menu.addItem((item) => {
+          item.setTitle("Cross-Reference with Catalog").setIcon("git-compare").onClick(async () => {
+            await this.openCrossReferenceCatalog(node);
+          });
+        });
+        if (node.file) {
+          const cache = this.app.metadataCache.getFileCache(node.file);
+          if (((_b = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _b.type) === "checkpoint") {
+            menu.addItem((item) => {
+              item.setTitle("Enrich Checkpoint (RLM)").setIcon("sparkles").onClick(async () => {
+                await this.openEnrichCheckpoint(node);
+              });
+            });
+          }
+          if (((_c = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _c.type) === "method" && cache.frontmatter.timestamp) {
+            menu.addItem((item) => {
+              item.setTitle("Extract WebM Clip").setIcon("video").onClick(async () => {
+                await this.extractClipFromMethod(node.file, cache.frontmatter);
+              });
+            });
+          }
+        }
+      })
+    );
+    this.registerEvent(
       this.app.workspace.on("file-menu", (menu, file) => {
-        if (!(file instanceof import_obsidian.TFile) || file.extension !== "md")
+        if (!(file instanceof import_obsidian.TFile))
           return;
+        if (file.extension === "canvas") {
+          if (this.settings.mode === "coach" && this.coachClient) {
+            menu.addItem((item) => {
+              item.setTitle("Share Canvas with Athlete").setIcon("send").onClick(async () => {
+                await this.shareCanvasWithAthlete(file);
+              });
+            });
+          }
+          return;
+        }
+        if (file.extension !== "md")
+          return;
+        const activeView = this.app.workspace.getActiveViewOfType(import_obsidian.ItemView);
+        const isCanvasView = activeView && activeView.getViewType() === "canvas";
+        if (isCanvasView) {
+          return;
+        }
         menu.addItem((item) => {
           item.setTitle("Get Training Drills").setIcon("dumbbell").onClick(async () => {
             await this.getTrainingDrillsForConcept(file);
           });
         });
+        menu.addItem((item) => {
+          item.setTitle("Research This Concept").setIcon("search").onClick(async () => {
+            await this.researchConcept(file);
+          });
+        });
+        if (this.settings.mode === "coach" && this.coachClient) {
+          menu.addItem((item) => {
+            item.setTitle("Share with Athlete via Discord").setIcon("send").onClick(async () => {
+              await this.shareConceptGraphWithAthlete(file);
+            });
+          });
+        }
       })
     );
     this.checkConnection();
@@ -549,6 +684,1179 @@ ${job.query_text}
 *Run "Coach: Generate article" to populate this section*
 
 `;
+  }
+  async shareConceptGraphWithAthlete(file) {
+    if (!this.coachClient) {
+      new import_obsidian.Notice("Coach mode not configured");
+      return;
+    }
+    const content = await this.app.vault.read(file);
+    const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!frontmatterMatch) {
+      new import_obsidian.Notice("No frontmatter found");
+      return;
+    }
+    const fm = frontmatterMatch[1];
+    const isCluster = fm.includes("type: cluster-index");
+    const isConcept = fm.includes("type: concept");
+    if (!isCluster && !isConcept) {
+      new import_obsidian.Notice("This file is not a concept or cluster file");
+      return;
+    }
+    try {
+      const athletes = await this.coachClient.getAthletes();
+      if (athletes.length === 0) {
+        new import_obsidian.Notice("No athletes found. Add athletes first.");
+        return;
+      }
+      const modal = new AthleteSelectModal(this.app, athletes, async (selectedAthlete) => {
+        var _a;
+        if (!selectedAthlete)
+          return;
+        let graphData = {};
+        let conceptName = file.basename;
+        let conceptSummary = "";
+        if (isCluster) {
+          const clusterFolder = ((_a = file.parent) == null ? void 0 : _a.path) || "";
+          const conceptFiles = this.app.vault.getMarkdownFiles().filter(
+            (f) => f.path.startsWith(clusterFolder) && f.path !== file.path
+          );
+          const concepts = [];
+          for (const cf of conceptFiles) {
+            const cfContent = await this.app.vault.read(cf);
+            concepts.push({
+              name: cf.basename,
+              content: cfContent
+            });
+          }
+          graphData = {
+            type: "cluster",
+            clusterName: conceptName,
+            concepts,
+            indexContent: content
+          };
+          const summaryMatch = content.match(/## Summary\n\n([\s\S]*?)(?=\n## |$)/);
+          conceptSummary = summaryMatch ? summaryMatch[1].trim().substring(0, 200) : "";
+        } else {
+          graphData = {
+            type: "concept",
+            conceptName,
+            content
+          };
+          const summaryMatch = content.match(/## Summary\n\n([\s\S]*?)(?=\n## |$)/);
+          conceptSummary = summaryMatch ? summaryMatch[1].trim().substring(0, 200) : "";
+        }
+        new import_obsidian.Notice(`Sharing "${conceptName}" with ${selectedAthlete.display_name || selectedAthlete.discord_username}...`);
+        try {
+          const result = await this.coachClient.shareConceptGraph(
+            selectedAthlete.id,
+            conceptName,
+            conceptSummary,
+            graphData
+          );
+          if (result.success) {
+            new import_obsidian.Notice(`Shared with ${selectedAthlete.display_name || selectedAthlete.discord_username}`);
+          } else {
+            new import_obsidian.Notice(`Saved but Discord notification failed: ${result.message}`);
+          }
+        } catch (error) {
+          new import_obsidian.Notice(`Failed to share: ${error.message}`);
+        }
+      });
+      modal.open();
+    } catch (error) {
+      new import_obsidian.Notice(`Failed to get athletes: ${error.message}`);
+    }
+  }
+  async shareCanvasWithAthlete(file) {
+    if (!this.coachClient) {
+      new import_obsidian.Notice("Coach mode not configured");
+      return;
+    }
+    const content = await this.app.vault.read(file);
+    let canvasData;
+    try {
+      canvasData = JSON.parse(content);
+    } catch (e) {
+      new import_obsidian.Notice("Invalid canvas file");
+      return;
+    }
+    const canvasName = file.basename;
+    try {
+      const athletes = await this.coachClient.getAthletes();
+      if (athletes.length === 0) {
+        new import_obsidian.Notice("No athletes found. Add athletes first.");
+        return;
+      }
+      const modal = new AthleteSelectModal(this.app, athletes, async (selectedAthlete) => {
+        if (!selectedAthlete)
+          return;
+        new import_obsidian.Notice(`Sharing canvas "${canvasName}" with ${selectedAthlete.display_name || selectedAthlete.discord_username}...`);
+        try {
+          const result = await this.coachClient.shareConceptGraph(
+            selectedAthlete.id,
+            canvasName + " (Timeline)",
+            "Visual timeline canvas for training sequence",
+            {
+              type: "canvas",
+              canvasName,
+              nodes: canvasData.nodes || [],
+              edges: canvasData.edges || []
+            }
+          );
+          if (result.success) {
+            new import_obsidian.Notice(`Shared with ${selectedAthlete.display_name || selectedAthlete.discord_username}!`);
+          } else {
+            new import_obsidian.Notice(`Saved but Discord notification failed: ${result.message}`);
+          }
+        } catch (error) {
+          new import_obsidian.Notice(`Failed to share: ${error.message}`);
+        }
+      });
+      modal.open();
+    } catch (error) {
+      new import_obsidian.Notice(`Failed to get athletes: ${error.message}`);
+    }
+  }
+  /**
+   * Extract WebM video clips from a Training Review article and create a Canvas with embedded clips.
+   * Non-destructive: original videos are never modified, clips are created as new files.
+   */
+  async extractVideoClipsToCanvas(file) {
+    var _a, _b;
+    const content = await this.app.vault.read(file);
+    if (!content.includes("type: training-review")) {
+      new import_obsidian.Notice("This command works on Training Review files");
+      return;
+    }
+    const frontmatterEnd = content.indexOf("---", 4);
+    if (frontmatterEnd === -1) {
+      new import_obsidian.Notice("No frontmatter found");
+      return;
+    }
+    const articleContent = content.substring(frontmatterEnd + 3);
+    new import_obsidian.Notice("Extracting video clips... This may take a moment.", 5e3);
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/extract-clips-webm-from-article`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify({
+          article_html: articleContent,
+          duration: 60
+          // 1 minute clips
+        })
+      });
+      const data = response.json;
+      const clips = data.clips || [];
+      if (clips.length === 0) {
+        new import_obsidian.Notice("No video clips found in article");
+        return;
+      }
+      new import_obsidian.Notice(`Found ${clips.length} clips. Downloading...`, 5e3);
+      const reviewName = file.basename;
+      const clipsFolder = `${((_a = file.parent) == null ? void 0 : _a.path) || this.settings.syncFolder}/clips/${reviewName}`;
+      await this.ensureFolder(clipsFolder);
+      const savedClips = [];
+      for (let i = 0; i < clips.length; i++) {
+        const clip = clips[i];
+        const clipFilename = `${clip.video_id}_${clip.start_time}s.webm`;
+        const clipPath = `${clipsFolder}/${clipFilename}`;
+        try {
+          const clipResponse = await (0, import_obsidian.requestUrl)({
+            url: `${this.settings.serverUrl}${clip.clip_url}`,
+            method: "GET"
+          });
+          await this.app.vault.adapter.writeBinary(clipPath, clipResponse.arrayBuffer);
+          savedClips.push({ path: clipPath, clip });
+          new import_obsidian.Notice(`Downloaded clip ${i + 1}/${clips.length}`, 2e3);
+        } catch (clipErr) {
+          console.error(`Failed to download clip ${clip.clip_id}:`, clipErr);
+        }
+      }
+      if (savedClips.length === 0) {
+        new import_obsidian.Notice("Failed to download any clips");
+        return;
+      }
+      const canvasPath = `${((_b = file.parent) == null ? void 0 : _b.path) || this.settings.syncFolder}/${reviewName} - Video Clips.canvas`;
+      const nodes = [];
+      const edges = [];
+      let nodeId = 1;
+      const clipWidth = 400;
+      const clipHeight = 300;
+      const spacing = 50;
+      const cols = 3;
+      for (let i = 0; i < savedClips.length; i++) {
+        const { path, clip } = savedClips[i];
+        const row = Math.floor(i / cols);
+        const col = i % cols;
+        nodes.push({
+          id: `video-${nodeId++}`,
+          type: "file",
+          file: path,
+          x: col * (clipWidth + spacing),
+          y: row * (clipHeight + spacing + 80),
+          width: clipWidth,
+          height: clipHeight,
+          color: "5"
+          // Cyan for videos
+        });
+        nodes.push({
+          id: `label-${nodeId++}`,
+          type: "text",
+          text: `**${clip.instructor}**
+${clip.title}
+_at ${clip.timestamp}_`,
+          x: col * (clipWidth + spacing),
+          y: row * (clipHeight + spacing + 80) + clipHeight + 10,
+          width: clipWidth,
+          height: 70,
+          color: "0"
+        });
+      }
+      nodes.unshift({
+        id: "title",
+        type: "text",
+        text: `# Video Clips: ${reviewName}
+
+${savedClips.length} clips extracted from training review`,
+        x: 0,
+        y: -120,
+        width: cols * (clipWidth + spacing) - spacing,
+        height: 100,
+        color: "6"
+        // Purple for title
+      });
+      const canvasContent = JSON.stringify({ nodes, edges }, null, 2);
+      const existingCanvas = this.app.vault.getAbstractFileByPath(canvasPath);
+      if (existingCanvas instanceof import_obsidian.TFile) {
+        await this.app.vault.modify(existingCanvas, canvasContent);
+      } else {
+        await this.app.vault.create(canvasPath, canvasContent);
+      }
+      new import_obsidian.Notice(`Created video canvas with ${savedClips.length} clips!`, 5e3);
+      const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
+      if (canvasFile instanceof import_obsidian.TFile) {
+        await this.app.workspace.getLeaf().openFile(canvasFile);
+      }
+    } catch (error) {
+      console.error("Video clip extraction error:", error);
+      new import_obsidian.Notice(`Failed to extract clips: ${error.message}`, 5e3);
+    }
+  }
+  /**
+   * Search videos for checkpoint/concept demonstrations.
+   * Uses semantic search to find videos that demonstrate a specific technique.
+   */
+  async searchVideosForConcept(conceptName, context) {
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/search-videos-for-concept`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify({
+          concept: conceptName,
+          context: context || "",
+          max_results: 5
+        })
+      });
+      return response.json.videos || [];
+    } catch (error) {
+      console.error("Video search error:", error);
+      return [];
+    }
+  }
+  /**
+   * Find videos demonstrating a concept and create a canvas with clips.
+   * Uses semantic search (separate from Oracle) to find matching videos.
+   */
+  async findVideosForConcept(file) {
+    var _a, _b;
+    const content = await this.app.vault.read(file);
+    const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!frontmatterMatch) {
+      new import_obsidian.Notice("No frontmatter found");
+      return;
+    }
+    const frontmatter = frontmatterMatch[1];
+    const conceptName = file.basename;
+    const summaryMatch = content.match(/## Summary\n\n([^\n#]+)/);
+    const context = summaryMatch ? summaryMatch[1].trim() : "";
+    new import_obsidian.Notice(`Searching for videos demonstrating "${conceptName}"...`, 5e3);
+    try {
+      const videos = await this.searchVideosForConcept(conceptName, context);
+      if (videos.length === 0) {
+        new import_obsidian.Notice(`No videos found for "${conceptName}"`, 3e3);
+        return;
+      }
+      new import_obsidian.Notice(`Found ${videos.length} videos! Creating canvas...`, 3e3);
+      const clipsFolder = `${((_a = file.parent) == null ? void 0 : _a.path) || this.settings.syncFolder}/clips/${conceptName}`;
+      await this.ensureFolder(clipsFolder);
+      const savedClips = [];
+      for (let i = 0; i < videos.length; i++) {
+        const video = videos[i];
+        if (!video.clip_url)
+          continue;
+        const clipFilename = `${video.video_id}_${video.timestamp_seconds || 0}s.webm`;
+        const clipPath = `${clipsFolder}/${clipFilename}`;
+        try {
+          const clipResponse = await (0, import_obsidian.requestUrl)({
+            url: `${this.settings.serverUrl}${video.clip_url}`,
+            method: "GET"
+          });
+          await this.app.vault.adapter.writeBinary(clipPath, clipResponse.arrayBuffer);
+          savedClips.push({ path: clipPath, video });
+          new import_obsidian.Notice(`Downloaded clip ${i + 1}/${videos.length}`, 2e3);
+        } catch (err) {
+          console.error(`Failed to download clip:`, err);
+        }
+      }
+      if (savedClips.length === 0) {
+        new import_obsidian.Notice("Failed to download any clips");
+        return;
+      }
+      const canvasPath = `${((_b = file.parent) == null ? void 0 : _b.path) || this.settings.syncFolder}/${conceptName} - Videos.canvas`;
+      const nodes = [];
+      let nodeId = 1;
+      const clipWidth = 400;
+      const clipHeight = 300;
+      const spacing = 50;
+      const cols = 2;
+      nodes.push({
+        id: "title",
+        type: "text",
+        text: `# Videos: ${conceptName}
+
+${savedClips.length} videos demonstrating this technique`,
+        x: 0,
+        y: -120,
+        width: cols * (clipWidth + spacing) - spacing,
+        height: 100,
+        color: "6"
+      });
+      for (let i = 0; i < savedClips.length; i++) {
+        const { path, video } = savedClips[i];
+        const row = Math.floor(i / cols);
+        const col = i % cols;
+        nodes.push({
+          id: `video-${nodeId++}`,
+          type: "file",
+          file: path,
+          x: col * (clipWidth + spacing),
+          y: row * (clipHeight + spacing + 80),
+          width: clipWidth,
+          height: clipHeight,
+          color: "5"
+        });
+        nodes.push({
+          id: `label-${nodeId++}`,
+          type: "text",
+          text: `**${video.instructor || "Unknown"}**
+${video.title || ""}
+_at ${video.timestamp || "0:00"}_
+
+${video.relevance_quote || ""}`,
+          x: col * (clipWidth + spacing),
+          y: row * (clipHeight + spacing + 80) + clipHeight + 10,
+          width: clipWidth,
+          height: 100,
+          color: "0"
+        });
+      }
+      const canvasContent = JSON.stringify({ nodes, edges: [] }, null, 2);
+      const existingCanvas = this.app.vault.getAbstractFileByPath(canvasPath);
+      if (existingCanvas instanceof import_obsidian.TFile) {
+        await this.app.vault.modify(existingCanvas, canvasContent);
+      } else {
+        await this.app.vault.create(canvasPath, canvasContent);
+      }
+      new import_obsidian.Notice(`Created video canvas for "${conceptName}"!`, 5e3);
+      const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
+      if (canvasFile instanceof import_obsidian.TFile) {
+        await this.app.workspace.getLeaf().openFile(canvasFile);
+      }
+    } catch (error) {
+      console.error("Find videos error:", error);
+      new import_obsidian.Notice(`Failed to find videos: ${error.message}`, 5e3);
+    }
+  }
+  /**
+   * Video Explorer: Show video breakdown with clickable timestamps.
+   * Click a timestamp to generate a clip on-demand.
+   */
+  async exploreVideoForConcept(file) {
+    const content = await this.app.vault.read(file);
+    const conceptName = file.basename;
+    const summaryMatch = content.match(/## Summary\n\n([^\n#]+)/);
+    const context = summaryMatch ? summaryMatch[1].trim() : "";
+    new import_obsidian.Notice(`Searching for videos about "${conceptName}"...`, 3e3);
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/explore-video`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify({
+          concept: conceptName,
+          context
+        })
+      });
+      const data = response.json;
+      if (data.error) {
+        new import_obsidian.Notice(`No videos found for "${conceptName}"`, 3e3);
+        return;
+      }
+      const modal = new VideoExplorerModal(
+        this.app,
+        this,
+        data,
+        file
+      );
+      modal.open();
+    } catch (error) {
+      console.error("Video explorer error:", error);
+      new import_obsidian.Notice(`Failed to explore videos: ${error.message}`, 5e3);
+    }
+  }
+  /**
+   * Find video for Canvas node (right-click menu).
+   * First tries to find linked sources from parent article, falls back to semantic search.
+   */
+  async findVideoForCanvasNodeDirect(node) {
+    var _a;
+    let conceptName = "";
+    let sourceFile = null;
+    let sessionId = null;
+    if (node.file) {
+      sourceFile = node.file;
+      conceptName = sourceFile.basename;
+      const cache = this.app.metadataCache.getFileCache(sourceFile);
+      if ((_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.source_rlm_session) {
+        sessionId = cache.frontmatter.source_rlm_session;
+      }
+    } else if (node.text) {
+      const text = node.text;
+      const match = text.match(/\*\*([^*]+)\*\*/) || text.match(/^#*\s*(.+)$/m);
+      conceptName = match ? match[1].trim() : text.substring(0, 50).trim();
+    } else if (node.label) {
+      conceptName = node.label;
+    }
+    if (!conceptName) {
+      new import_obsidian.Notice("Could not get concept name from node");
+      return;
+    }
+    if (sessionId) {
+      new import_obsidian.Notice(`Finding linked sources for "${conceptName}"...`, 3e3);
+      try {
+        const response = await (0, import_obsidian.requestUrl)({
+          url: `${this.settings.serverUrl}/api/obsidian/sources-for-concept`,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${this.settings.apiToken}`
+          },
+          body: JSON.stringify({
+            session_id: sessionId,
+            concept_name: conceptName
+          })
+        });
+        const data = response.json;
+        if (data.sources && data.sources.length > 0) {
+          new import_obsidian.Notice(`Found ${data.sources.length} linked sources!`, 3e3);
+          const modal = new LinkedSourcesModal(
+            this.app,
+            this,
+            data,
+            sourceFile || { path: this.settings.syncFolder, parent: null, basename: conceptName }
+          );
+          modal.open();
+          return;
+        } else {
+          new import_obsidian.Notice("No linked sources found, trying semantic search...", 2e3);
+        }
+      } catch (error) {
+        console.error("Linked sources error:", error);
+        new import_obsidian.Notice("Linked sources failed, trying semantic search...", 2e3);
+      }
+    }
+    new import_obsidian.Notice(`Searching for "${conceptName}"...`, 3e3);
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/explore-video`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify({ concept: conceptName })
+      });
+      const data = response.json;
+      if (data.error) {
+        new import_obsidian.Notice(`No video found for "${conceptName}"`, 3e3);
+        return;
+      }
+      const modal = new VideoExplorerModal(
+        this.app,
+        this,
+        data,
+        sourceFile || { path: this.settings.syncFolder, parent: null, basename: conceptName }
+      );
+      modal.open();
+    } catch (error) {
+      console.error("Canvas video finder error:", error);
+      new import_obsidian.Notice(`Failed: ${error.message}`, 5e3);
+    }
+  }
+  /**
+   * Explore series for Canvas node (right-click menu).
+   * Uses linked sources from parent article when available.
+   */
+  async exploreSeriesForCanvasNode(node) {
+    var _a;
+    let conceptName = "";
+    let sourceFile = null;
+    let sessionId = null;
+    if (node.file) {
+      sourceFile = node.file;
+      conceptName = sourceFile.basename;
+      const cache = this.app.metadataCache.getFileCache(sourceFile);
+      if ((_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.source_rlm_session) {
+        sessionId = cache.frontmatter.source_rlm_session;
+      }
+    } else if (node.text) {
+      const text = node.text;
+      const match = text.match(/\*\*([^*]+)\*\*/) || text.match(/^#*\s*(.+)$/m);
+      conceptName = match ? match[1].trim() : text.substring(0, 50).trim();
+    } else if (node.label) {
+      conceptName = node.label;
+    }
+    if (!conceptName) {
+      new import_obsidian.Notice("Could not get concept name from node");
+      return;
+    }
+    new import_obsidian.Notice(`Finding series for "${conceptName}"${sessionId ? " (using linked sources)" : ""}...`, 3e3);
+    try {
+      const requestBody = { concept: conceptName };
+      if (sessionId) {
+        requestBody.session_id = sessionId;
+      }
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/explore-series`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify(requestBody)
+      });
+      const data = response.json;
+      if (data.error) {
+        new import_obsidian.Notice(`No series found for "${conceptName}"`, 3e3);
+        return;
+      }
+      new import_obsidian.Notice(`Found ${data.total_volumes} volumes!`, 3e3);
+      const modal = new SeriesExplorerModal(
+        this.app,
+        this,
+        data,
+        sourceFile || { path: this.settings.syncFolder, parent: null, basename: conceptName }
+      );
+      modal.open();
+    } catch (error) {
+      console.error("Canvas series finder error:", error);
+      new import_obsidian.Notice(`Failed: ${error.message}`, 5e3);
+    }
+  }
+  /**
+   * Show the complete bibliography of videos from the parent Oracle article.
+   * User can select any video to see its full concept cache.
+   */
+  async showArticleBibliography(node, sessionId) {
+    let sourceFile = null;
+    if (node.file) {
+      sourceFile = node.file;
+    }
+    new import_obsidian.Notice("Loading article bibliography...", 2e3);
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/article-bibliography`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify({ session_id: sessionId })
+      });
+      const data = response.json;
+      if (data.error) {
+        new import_obsidian.Notice(`Error: ${data.error}`, 3e3);
+        return;
+      }
+      new import_obsidian.Notice(`Found ${data.total_videos} source videos!`, 3e3);
+      const modal = new ArticleBibliographyModal(
+        this.app,
+        this,
+        data,
+        sourceFile || { path: this.settings.syncFolder, parent: null, basename: "Article" }
+      );
+      modal.open();
+    } catch (error) {
+      console.error("Article bibliography error:", error);
+      new import_obsidian.Notice(`Failed: ${error.message}`, 5e3);
+    }
+  }
+  /**
+   * Open the catalog browser for cross-reference research.
+   * User can select videos to cross-reference with the concept.
+   */
+  async openCrossReferenceCatalog(node) {
+    var _a;
+    let conceptName = "";
+    let conceptContext = "";
+    let sourceFile = null;
+    if (node.file) {
+      sourceFile = node.file;
+      conceptName = sourceFile.basename;
+      const cache = this.app.metadataCache.getFileCache(sourceFile);
+      if ((_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.cluster) {
+        conceptContext = `Part of ${cache.frontmatter.cluster}`;
+      }
+    } else if (node.text) {
+      const text = node.text;
+      const match = text.match(/\*\*([^*]+)\*\*/) || text.match(/^#*\s*(.+)$/m);
+      conceptName = match ? match[1].trim() : text.substring(0, 50).trim();
+    } else if (node.label) {
+      conceptName = node.label;
+    }
+    if (!conceptName) {
+      new import_obsidian.Notice("Could not get concept name from node");
+      return;
+    }
+    new import_obsidian.Notice(`Opening catalog for "${conceptName}"...`, 2e3);
+    const modal = new CatalogBrowserModal(
+      this.app,
+      this,
+      conceptName,
+      conceptContext,
+      sourceFile || { path: this.settings.syncFolder, parent: null, basename: conceptName }
+    );
+    modal.open();
+  }
+  /**
+   * Open RLM Enrichment for a checkpoint.
+   * Parses the checkpoint file, lets user select videos, enriches with new knowledge.
+   */
+  async openEnrichCheckpoint(node) {
+    if (!node.file) {
+      new import_obsidian.Notice("Checkpoint file not found");
+      return;
+    }
+    const sourceFile = node.file;
+    const cache = this.app.metadataCache.getFileCache(sourceFile);
+    if (!(cache == null ? void 0 : cache.frontmatter) || cache.frontmatter.type !== "checkpoint") {
+      new import_obsidian.Notice("This is not a checkpoint file");
+      return;
+    }
+    const content = await this.app.vault.read(sourceFile);
+    const invariablesMatch = content.match(/## INVARIABLES[\s\S]*?\|[\s\S]*?\|([\s\S]*?)(?=\n---|\n##|$)/);
+    const currentInvariables = [];
+    if (invariablesMatch) {
+      const links = invariablesMatch[1].match(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g) || [];
+      for (const link of links) {
+        const nameMatch = link.match(/\[\[(?:[^\]|]+\|)?([^\]]+)\]\]/);
+        if (nameMatch && nameMatch[1] !== "none") {
+          currentInvariables.push(nameMatch[1].trim());
+        }
+      }
+    }
+    const variablesMatch = content.match(/## VARIABLES[\s\S]*?((?:- \*\*IF.*\n?)+)/);
+    const currentVariables = [];
+    if (variablesMatch) {
+      const lines = variablesMatch[1].match(/- \*\*IF[^*]+\*\*[^\n]+/g) || [];
+      currentVariables.push(...lines.map((l) => l.replace(/^- /, "").trim()));
+    }
+    const goalMatch = content.match(/## Goal\n\n([^\n]+)/);
+    const goal = goalMatch ? goalMatch[1].trim() : "";
+    const successMatch = content.match(/## Success Test\n\n> ([^\n]+)/);
+    const successTest = successMatch ? successMatch[1].trim() : "";
+    new import_obsidian.Notice(`Opening enrichment for "${sourceFile.basename}"...`, 2e3);
+    const modal = new EnrichCheckpointModal(
+      this.app,
+      this,
+      {
+        name: sourceFile.basename,
+        cluster: cache.frontmatter.cluster || "",
+        currentInvariables,
+        currentVariables,
+        goal,
+        successTest
+      },
+      sourceFile
+    );
+    modal.open();
+  }
+  /**
+   * RLM Pipeline - Single button for: Backup → Enrich → Rebuild Canvas
+   */
+  async runRLMPipeline(canvasView) {
+    var _a;
+    try {
+      const canvas = canvasView.canvas;
+      if (!canvas) {
+        new import_obsidian.Notice("Could not access canvas");
+        return;
+      }
+      const canvasFile = canvasView.file;
+      if (!canvasFile) {
+        new import_obsidian.Notice("Could not determine canvas file");
+        return;
+      }
+      const parentFolder = canvasFile.parent;
+      if (!parentFolder) {
+        new import_obsidian.Notice("Could not determine folder");
+        return;
+      }
+      const canvasBasename = canvasFile.basename;
+      const subfolderPath = `${parentFolder.path}/${canvasBasename}`;
+      const subfolder = this.app.vault.getAbstractFileByPath(subfolderPath);
+      const targetFolderPath = subfolder && subfolder instanceof import_obsidian.TFolder ? subfolderPath : parentFolder.path;
+      console.log("Canvas:", canvasFile.path);
+      console.log("Looking for checkpoints in:", targetFolderPath);
+      const checkpointFiles = [];
+      for (const file of this.app.vault.getFiles()) {
+        if (file.extension !== "md")
+          continue;
+        if (((_a = file.parent) == null ? void 0 : _a.path) !== targetFolderPath)
+          continue;
+        const cache = this.app.metadataCache.getFileCache(file);
+        const frontmatter = cache == null ? void 0 : cache.frontmatter;
+        if ((frontmatter == null ? void 0 : frontmatter.type) === "checkpoint") {
+          checkpointFiles.push(file);
+          console.log("Found checkpoint:", file.basename);
+        }
+      }
+      checkpointFiles.sort((a, b) => {
+        var _a2, _b, _c, _d;
+        const cacheA = this.app.metadataCache.getFileCache(a);
+        const cacheB = this.app.metadataCache.getFileCache(b);
+        const orderA = ((_a2 = cacheA == null ? void 0 : cacheA.frontmatter) == null ? void 0 : _a2.order) || parseInt(((_b = a.basename.match(/\[(\d+)\]/)) == null ? void 0 : _b[1]) || "99");
+        const orderB = ((_c = cacheB == null ? void 0 : cacheB.frontmatter) == null ? void 0 : _c.order) || parseInt(((_d = b.basename.match(/\[(\d+)\]/)) == null ? void 0 : _d[1]) || "99");
+        return orderA - orderB;
+      });
+      console.log("Found checkpoints:", checkpointFiles.map((f) => f.basename));
+      if (checkpointFiles.length === 0) {
+        new import_obsidian.Notice(`No checkpoint files found in ${targetFolderPath}. Files need frontmatter: type: checkpoint`);
+        return;
+      }
+      const targetFolder = this.app.vault.getAbstractFileByPath(targetFolderPath);
+      const modal = new RLMPipelineModal(
+        this.app,
+        this,
+        canvasFile,
+        targetFolder,
+        checkpointFiles
+      );
+      modal.open();
+    } catch (error) {
+      new import_obsidian.Notice(`Error: ${error.message}`);
+      console.error("RLM Pipeline error:", error);
+    }
+  }
+  /**
+   * Rebuild Canvas from checkpoint files - proper layout with all connections.
+   * This regenerates the entire canvas from the enriched markdown files.
+   */
+  async rebuildCanvasFromCheckpoints() {
+    var _a;
+    const activeFile = this.app.workspace.getActiveFile();
+    if (!activeFile) {
+      new import_obsidian.Notice("Open a file in the checkpoint folder first");
+      return;
+    }
+    const folder = activeFile.parent;
+    if (!folder) {
+      new import_obsidian.Notice("Could not determine folder");
+      return;
+    }
+    new import_obsidian.Notice(`Scanning ${folder.path} for checkpoints...`);
+    try {
+      const checkpoints = [];
+      const methods = [];
+      for (const file of this.app.vault.getFiles()) {
+        if (!file.path.startsWith(folder.path) || file.extension !== "md")
+          continue;
+        const cache = this.app.metadataCache.getFileCache(file);
+        if (!(cache == null ? void 0 : cache.frontmatter))
+          continue;
+        const type = cache.frontmatter.type;
+        if (type === "checkpoint") {
+          const content = await this.app.vault.read(file);
+          const order = cache.frontmatter.order || parseInt(((_a = file.basename.match(/^\[?(\d+)/)) == null ? void 0 : _a[1]) || "99");
+          const invariables = [];
+          const invMatch = content.match(/## INVARIABLES[\s\S]*?\|([\s\S]*?)(?=\n##|\n---)/);
+          if (invMatch) {
+            const links = invMatch[1].match(/\[\[([^\]|]+)/g) || [];
+            for (const link of links) {
+              const name = link.replace("[[", "").trim();
+              if (name && name !== "none") {
+                invariables.push(name);
+              }
+            }
+          }
+          const navigation = [];
+          const navMatch = content.match(/## Navigation[\s\S]*?((?:\[\[[^\]]+\]\][^\n]*\n?)+)/);
+          if (navMatch) {
+            const navLinks = navMatch[1].match(/\[\[([^\]|]+)/g) || [];
+            for (const link of navLinks) {
+              navigation.push(link.replace("[[", "").trim());
+            }
+          }
+          checkpoints.push({
+            file,
+            order,
+            cluster: cache.frontmatter.cluster || "",
+            invariables,
+            navigation
+          });
+        } else if (type === "method" || type === "concept") {
+          methods.push({
+            file,
+            tier: cache.frontmatter.tier || "REFINEMENT",
+            cluster: cache.frontmatter.cluster || ""
+          });
+        }
+      }
+      if (checkpoints.length === 0) {
+        new import_obsidian.Notice("No checkpoint files found in this folder");
+        return;
+      }
+      checkpoints.sort((a, b) => a.order - b.order);
+      new import_obsidian.Notice(`Found ${checkpoints.length} checkpoints, ${methods.length} methods. Building canvas...`);
+      const canvasData = {
+        nodes: [],
+        edges: []
+      };
+      const checkpointWidth = 300;
+      const checkpointHeight = 150;
+      const methodWidth = 200;
+      const methodHeight = 80;
+      const horizontalGap = 400;
+      const verticalGap = 200;
+      const methodOffsetX = 350;
+      const methodGap = 100;
+      let currentX = 100;
+      const checkpointY = 300;
+      const nodeIdMap = /* @__PURE__ */ new Map();
+      for (let i = 0; i < checkpoints.length; i++) {
+        const cp = checkpoints[i];
+        const nodeId = `checkpoint-${i}`;
+        nodeIdMap.set(cp.file.basename, nodeId);
+        canvasData.nodes.push({
+          id: nodeId,
+          type: "file",
+          file: cp.file.path,
+          x: currentX,
+          y: checkpointY,
+          width: checkpointWidth,
+          height: checkpointHeight,
+          color: "4"
+          // Blue for checkpoints
+        });
+        let methodY = checkpointY - methodGap - methodHeight;
+        for (const invName of cp.invariables) {
+          const methodFile = methods.find((m) => m.file.basename === invName);
+          if (methodFile) {
+            const methodId = `method-${nodeIdMap.size}`;
+            nodeIdMap.set(invName, methodId);
+            canvasData.nodes.push({
+              id: methodId,
+              type: "file",
+              file: methodFile.file.path,
+              x: currentX + methodOffsetX,
+              y: methodY,
+              width: methodWidth,
+              height: methodHeight,
+              color: methodFile.tier === "CRITICAL" ? "1" : methodFile.tier === "IMPORTANT" ? "6" : "0"
+            });
+            canvasData.edges.push({
+              id: `edge-${canvasData.edges.length}`,
+              fromNode: nodeId,
+              fromSide: "right",
+              toNode: methodId,
+              toSide: "left"
+            });
+            methodY -= methodHeight + 30;
+          }
+        }
+        if (i < checkpoints.length - 1) {
+          canvasData.edges.push({
+            id: `edge-cp-${i}`,
+            fromNode: nodeId,
+            fromSide: "right",
+            toNode: `checkpoint-${i + 1}`,
+            toSide: "left",
+            color: "5"
+          });
+        }
+        currentX += horizontalGap;
+      }
+      for (const cp of checkpoints) {
+        const fromId = nodeIdMap.get(cp.file.basename);
+        for (const navTarget of cp.navigation) {
+          const toId = nodeIdMap.get(navTarget);
+          if (fromId && toId && fromId !== toId) {
+            const exists = canvasData.edges.some(
+              (e) => e.fromNode === fromId && e.toNode === toId
+            );
+            if (!exists) {
+              canvasData.edges.push({
+                id: `edge-nav-${canvasData.edges.length}`,
+                fromNode: fromId,
+                fromSide: "bottom",
+                toNode: toId,
+                toSide: "top",
+                color: "3"
+                // Green for navigation
+              });
+            }
+          }
+        }
+      }
+      const canvasPath = `${folder.path}/${folder.name} - Generated.canvas`;
+      const canvasContent = JSON.stringify(canvasData, null, 2);
+      const existingCanvas = this.app.vault.getAbstractFileByPath(canvasPath);
+      if (existingCanvas) {
+        await this.app.vault.modify(existingCanvas, canvasContent);
+      } else {
+        await this.app.vault.create(canvasPath, canvasContent);
+      }
+      new import_obsidian.Notice(`Canvas created: ${canvasPath}`);
+      const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
+      if (canvasFile) {
+        await this.app.workspace.getLeaf().openFile(canvasFile);
+      }
+    } catch (error) {
+      new import_obsidian.Notice(`Error: ${error.message}`);
+      console.error("Rebuild canvas error:", error);
+    }
+  }
+  /**
+   * Extract WebM clip from a method node - shows clip browser with options.
+   */
+  async extractClipFromMethod(file, frontmatter) {
+    const { video_id, source_instructor } = frontmatter;
+    const conceptName = file.basename;
+    if (!video_id) {
+      new import_obsidian.Notice("No video_id found - cannot extract clip");
+      return;
+    }
+    new import_obsidian.Notice(`Finding clip options for "${conceptName}"...`);
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/clip-options`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify({
+          video_id,
+          concept: conceptName,
+          instructor: source_instructor || ""
+        })
+      });
+      const data = response.json;
+      if (data.error) {
+        new import_obsidian.Notice(`Error: ${data.error}`);
+        return;
+      }
+      const modal = new ClipBrowserModal(
+        this.app,
+        this,
+        file,
+        data
+      );
+      modal.open();
+    } catch (error) {
+      new import_obsidian.Notice(`Error finding clips: ${error.message}`);
+      console.error("Clip options error:", error);
+    }
+  }
+  /**
+   * Actually extract a WebM clip after user selects it.
+   */
+  async doExtractClip(videoId, startTime, duration, outputName) {
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/extract-clip`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify({
+          video_id: videoId,
+          start_time: startTime,
+          duration,
+          output_name: outputName
+        })
+      });
+      const data = response.json;
+      if (data.clip_path) {
+        return data.clip_path;
+      }
+      return null;
+    } catch (error) {
+      console.error("Extract clip error:", error);
+      return null;
+    }
+  }
+  /**
+   * Find video for selected Canvas node.
+   * Shows concept cache with clickable timestamps.
+   */
+  async findVideoForCanvasNode(canvasView) {
+    try {
+      const canvas = canvasView.canvas;
+      if (!canvas) {
+        new import_obsidian.Notice("Could not access canvas");
+        return;
+      }
+      const selection = canvas.selection;
+      if (!selection || selection.size === 0) {
+        new import_obsidian.Notice("Select a concept node in the canvas first");
+        return;
+      }
+      const selectedNode = Array.from(selection)[0];
+      let conceptName = "";
+      let sourceFile = null;
+      if (selectedNode.file) {
+        sourceFile = selectedNode.file;
+        conceptName = sourceFile.basename;
+      } else if (selectedNode.text) {
+        const text = selectedNode.text;
+        const match = text.match(/\*\*([^*]+)\*\*/) || text.match(/^#*\s*(.+)$/m);
+        conceptName = match ? match[1].trim() : text.substring(0, 50).trim();
+      } else {
+        new import_obsidian.Notice("Select a concept node (file or text node)");
+        return;
+      }
+      if (!conceptName) {
+        new import_obsidian.Notice("Could not determine concept name from node");
+        return;
+      }
+      new import_obsidian.Notice(`Finding video for "${conceptName}"...`, 3e3);
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/explore-video`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify({
+          concept: conceptName
+        })
+      });
+      const data = response.json;
+      if (data.error) {
+        new import_obsidian.Notice(`No video found for "${conceptName}"`, 3e3);
+        return;
+      }
+      const tempFile = sourceFile || this.app.vault.getAbstractFileByPath(
+        `${this.settings.syncFolder}/temp-concept.md`
+      );
+      const modal = new VideoExplorerModal(
+        this.app,
+        this,
+        data,
+        tempFile || { path: this.settings.syncFolder, parent: null, basename: conceptName }
+      );
+      modal.open();
+    } catch (error) {
+      console.error("Canvas video finder error:", error);
+      new import_obsidian.Notice(`Failed to find video: ${error.message}`, 5e3);
+    }
+  }
+  /**
+   * Series Explorer: Show all volumes in a video series with clickable timestamps.
+   */
+  async exploreSeriesForConcept(file) {
+    const content = await this.app.vault.read(file);
+    const conceptName = file.basename;
+    new import_obsidian.Notice(`Searching for video series about "${conceptName}"...`, 3e3);
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/explore-series`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify({
+          concept: conceptName
+        })
+      });
+      const data = response.json;
+      if (data.error) {
+        new import_obsidian.Notice(`No video series found for "${conceptName}"`, 3e3);
+        return;
+      }
+      new import_obsidian.Notice(`Found ${data.total_volumes} volumes in "${data.series_name}"!`, 3e3);
+      const modal = new SeriesExplorerModal(
+        this.app,
+        this,
+        data,
+        file
+      );
+      modal.open();
+    } catch (error) {
+      console.error("Series explorer error:", error);
+      new import_obsidian.Notice(`Failed to explore series: ${error.message}`, 5e3);
+    }
+  }
+  /**
+   * Generate a clip on-demand and save to vault.
+   */
+  async generateClipOnDemand(videoId, timestampSeconds, targetFolder) {
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/generate-clip-on-demand`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        },
+        body: JSON.stringify({
+          video_id: videoId,
+          timestamp_seconds: timestampSeconds,
+          duration: 60
+        })
+      });
+      const clipData = response.json;
+      if (!clipData.clip_url) {
+        return null;
+      }
+      const clipResponse = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}${clipData.clip_url}`,
+        method: "GET"
+      });
+      const clipFilename = `${videoId}_${timestampSeconds}s.webm`;
+      const clipPath = `${targetFolder}/${clipFilename}`;
+      await this.ensureFolder(targetFolder);
+      await this.app.vault.adapter.writeBinary(clipPath, clipResponse.arrayBuffer);
+      return clipPath;
+    } catch (error) {
+      console.error("Clip generation error:", error);
+      return null;
+    }
   }
   async coachShowPending() {
     if (!this.coachClient) {
@@ -757,7 +2065,7 @@ ${article}`;
       new import_obsidian.Notice("Coach mode not configured");
       return;
     }
-    const conceptsFolder = `${this.settings.syncFolder}/Concepts`;
+    const conceptsFolder = `${this.settings.syncFolder}/${this.settings.conceptsSubfolder}`;
     const conceptFiles = this.app.vault.getMarkdownFiles().filter(
       (f) => f.path.startsWith(conceptsFolder) && !f.basename.startsWith("_")
     );
@@ -886,11 +2194,11 @@ ${article}`;
         status: "pending"
       });
       await this.createPendingJobNote(jobId, query);
-      new import_obsidian.Notice("Query sent to coach! You'll be notified when ready.");
+      new import_obsidian.Notice("Query sent to Oracle! You'll be notified when ready.");
       return jobId;
     } catch (error) {
       console.error("Failed to submit query:", error);
-      new import_obsidian.Notice("Failed to send query to coach. Check your connection.");
+      new import_obsidian.Notice("Failed to send query to Oracle. Check your connection.");
       return null;
     }
   }
@@ -919,7 +2227,7 @@ status: pending
 
 ---
 
-*Waiting for coach to process...*
+*Waiting for Oracle to process...*
 
 This note will be updated when results are ready.
 `;
@@ -1031,18 +2339,18 @@ This note will be updated when results are ready.
           msg.push(`${synced} research article(s)`);
         if (conceptsSynced > 0)
           msg.push(`${conceptsSynced} concept(s)`);
-        new import_obsidian.Notice(`Synced ${msg.join(" and ")} from coach!`);
+        new import_obsidian.Notice(`Synced ${msg.join(" and ")} from Oracle!`);
       } else {
         new import_obsidian.Notice("All research already synced");
       }
     } catch (error) {
       console.error("[Flipmode] Sync error:", error);
-      new import_obsidian.Notice("Failed to sync from coach");
+      new import_obsidian.Notice("Failed to sync from Oracle");
     }
   }
   async syncConceptsToVault(concepts) {
     var _a;
-    const folder = `${this.settings.syncFolder}/Concepts`;
+    const folder = `${this.settings.syncFolder}/${this.settings.conceptsSubfolder}`;
     await this.ensureFolder(folder);
     let created = 0;
     for (const concept of concepts) {
@@ -1059,7 +2367,7 @@ This note will be updated when results are ready.
       const content = `---
 type: concept
 parent: "${concept.parent || ""}"
-tags: [concept, bjj, ${((_a = concept.category) == null ? void 0 : _a.toLowerCase()) || "technique"}]
+tags: [concept, grappling, ${((_a = concept.category) == null ? void 0 : _a.toLowerCase()) || "technique"}]
 ---
 
 # ${concept.name}
@@ -1110,12 +2418,12 @@ ${relatedLinks}
     const shortQuery = (job.enriched_query || job.query_text || "Research").substring(0, 50).replace(/[^\w\s-]/g, "").trim();
     const filename = `${folder}/${date} - ${shortQuery}.md`;
     const content = `---
-type: coach-research
+type: oracle-research
 job_id: ${job.job_id}
 query: "${job.enriched_query || job.query_text}"
 received: ${new Date().toISOString()}
 rlm_session_id: ${result.rlm_session_id || ""}
-tags: [bjj, research, from-coach]
+tags: [bjj, research, from-oracle]
 ---
 
 # Research: ${shortQuery}
@@ -1123,7 +2431,7 @@ tags: [bjj, research, from-coach]
 ${result.article}
 
 ---
-*Research provided by your coach*
+*Research provided by Oracle*
 `;
     await this.app.vault.create(filename, content);
     return filename;
@@ -1698,7 +3006,6 @@ ${deepDiveContent}
   }
   // Explode article content into linked concept graph nodes
   async explodeToConceptGraph(editor, view, selection) {
-    var _a;
     const file = view.file;
     if (!file) {
       new import_obsidian.Notice("No file open");
@@ -1736,157 +3043,358 @@ ${deepDiveContent}
         new import_obsidian.Notice(`Explode failed: ${result.error}`, 5e3);
         return;
       }
-      const concepts = result.concepts || [];
-      if (concepts.length === 0) {
-        new import_obsidian.Notice("No concepts extracted");
+      const checkpoints = result.checkpoints || [];
+      if (checkpoints.length === 0) {
+        new import_obsidian.Notice("No checkpoints extracted");
         return;
       }
-      const conceptsFolder = `${this.settings.syncFolder}/Concepts`;
+      const topicName = result.topic_name || file.basename;
+      const topicTags = result.topic_tags || [];
+      const clusterName = topicName.replace(/[^\w\s-]/g, "").trim();
+      const conceptsBase = `${this.settings.syncFolder}/${this.settings.conceptsSubfolder}`;
+      const conceptsFolder = `${conceptsBase}/${clusterName}`;
       await this.ensureFolder(conceptsFolder);
+      const normalizeName = (name) => {
+        if (!name)
+          return "";
+        let clean = name.replace(/[^\w\s-]/g, "").trim();
+        clean = clean.replace(/^(The|A|An)\s+/i, "");
+        return clean;
+      };
+      const topicTagsStr = topicTags.length > 0 ? topicTags.map((t) => t.toLowerCase().replace(/\s+/g, "-")).join(", ") : "";
       let createdCount = 0;
-      for (const concept of concepts) {
-        const conceptName = concept.name.replace(/[^\w\s-]/g, "").trim();
-        const conceptPath = `${conceptsFolder}/${conceptName}.md`;
-        const existing = this.app.vault.getAbstractFileByPath(conceptPath);
-        if (existing) {
+      const createdNames = /* @__PURE__ */ new Set();
+      checkpoints.sort((a, b) => (a.order || 1) - (b.order || 1));
+      for (let i = 0; i < checkpoints.length; i++) {
+        const cp = checkpoints[i];
+        const cpName = normalizeName(cp.name);
+        if (!cpName || createdNames.has(cpName.toLowerCase()))
+          continue;
+        const cpPath = `${conceptsFolder}/${cpName}.md`;
+        if (this.app.vault.getAbstractFileByPath(cpPath)) {
+          createdNames.add(cpName.toLowerCase());
           continue;
         }
-        const parentLink = concept.parent ? `[[${concept.parent}]]` : "Root concept";
-        const prereqLinks = (concept.prerequisites || []).map((p) => `- [[${p}]]`).join("\n") || "- None";
-        const leadsToLinks = (concept.leads_to || []).map((l) => `- [[${l}]]`).join("\n") || "- None";
-        const counterLinks = (concept.counters || []).map((c) => `- [[${c}]]`).join("\n") || "- None";
-        const relatedLinks = (concept.related || []).map((r) => `- [[${r}]]`).join("\n") || "- None";
-        const tier = concept.tier || "tier3";
-        const tierTag = tier === "title" ? "priority/title" : `priority/${tier}`;
-        const conceptContent = `---
-type: concept
-tier: "${tier}"
-parent: "${concept.parent || ""}"
-tags: [concept, bjj, ${((_a = concept.category) == null ? void 0 : _a.toLowerCase()) || "technique"}, ${tierTag}]
+        const order = cp.order || i + 1;
+        const prevCp = i > 0 ? normalizeName(checkpoints[i - 1].name) : null;
+        const nextCp = i < checkpoints.length - 1 ? normalizeName(checkpoints[i + 1].name) : null;
+        const invariables = cp.invariables || [];
+        const tier1 = invariables.filter((inv) => inv.tier === "tier1");
+        const tier2 = invariables.filter((inv) => inv.tier === "tier2");
+        const tier3 = invariables.filter((inv) => inv.tier === "tier3" || !inv.tier);
+        const formatTierLinks = (items) => items.length > 0 ? items.map((inv) => `[[${clusterName}/${normalizeName(inv.name)}|${normalizeName(inv.name)}]]`).join(" \xB7 ") : "*none*";
+        const variables = cp.variables || [];
+        const varLinks = variables.length > 0 ? variables.map((v) => `- **${v.trigger}** \u2192 [[${clusterName}/${normalizeName(v.name)}|${normalizeName(v.name)}]]`).join("\n") : "*No situational responses*";
+        const content = `---
+type: checkpoint
+order: ${order}
+cluster: "${clusterName}"
+tags: [grappling, checkpoint${topicTagsStr ? ", " + topicTagsStr : ""}]
 source_file: "${file.basename}"
 source_rlm_session: "${sourceRlmSessionId}"
 ---
 
-# ${concept.name}
+# [${order}] ${cpName}
 
-**Category:** ${concept.category || "Technique"}  |  **Priority:** ${tier === "title" ? "\u{1F3AF} Title Concept" : tier === "tier1" ? "\u{1F534} Tier 1 - Critical" : tier === "tier2" ? "\u{1F7E1} Tier 2 - Important" : "\u{1F7E2} Tier 3 - Supporting"}
-**Parent:** ${parentLink}
+> [!success] CHECKPOINT ${order} of ${checkpoints.length}
 
-## Summary
+## Goal
 
-${concept.summary || "No summary available."}
+${cp.goal || "No goal defined."}
 
-## Prerequisites
+## Success Test
 
-${prereqLinks}
+> ${cp.success_test || "No test defined."}
 
-## Leads To
+---
 
-${leadsToLinks}
+## INVARIABLES (Always Do Together)
 
-## Counters
+| Tier | Concepts |
+|------|----------|
+| CRITICAL | ${formatTierLinks(tier1)} |
+| IMPORTANT | ${formatTierLinks(tier2)} |
+| REFINEMENT | ${formatTierLinks(tier3)} |
 
-${counterLinks}
+---
 
-## Related Concepts
+## VARIABLES (IF/THEN)
 
-${relatedLinks}
+${varLinks}
+
+---
+
+## Navigation
+
+| Previous | Next |
+|----------|------|
+| ${prevCp ? `[[${clusterName}/${prevCp}|< ${prevCp}]]` : "*Start*"} | ${nextCp ? `[[${clusterName}/${nextCp}|${nextCp} >]]` : "*End*"} |
 `;
-        await this.app.vault.create(conceptPath, conceptContent);
+        await this.app.vault.create(cpPath, content);
+        createdNames.add(cpName.toLowerCase());
         createdCount++;
       }
-      const linkedConceptContext = /* @__PURE__ */ new Map();
-      const getContext = (name) => {
-        if (!linkedConceptContext.has(name)) {
-          linkedConceptContext.set(name, {
-            isPrerequisiteFor: [],
-            leadsTo: [],
-            counters: [],
-            counteredBy: [],
-            relatedTo: [],
-            parentOf: [],
-            childOf: []
-          });
-        }
-        return linkedConceptContext.get(name);
-      };
-      for (const concept of concepts) {
-        if (concept.parent) {
-          getContext(concept.parent).parentOf.push(concept.name);
-        }
-        for (const p of concept.prerequisites || []) {
-          getContext(p).leadsTo.push(concept.name);
-          getContext(p).isPrerequisiteFor.push(concept.name);
-        }
-        for (const l of concept.leads_to || []) {
-          getContext(l).childOf.push(concept.name);
-        }
-        for (const c of concept.counters || []) {
-          getContext(c).counteredBy.push(concept.name);
-        }
-        for (const r of concept.related || []) {
-          getContext(r).relatedTo.push(concept.name);
-        }
-      }
-      for (const concept of concepts) {
-        linkedConceptContext.delete(concept.name);
-      }
-      let stubCount = 0;
-      for (const [linkedName, ctx] of linkedConceptContext) {
-        const safeName = linkedName.replace(/[^\w\s-]/g, "").trim();
-        const stubPath = `${conceptsFolder}/${safeName}.md`;
-        if (this.app.vault.getAbstractFileByPath(stubPath))
-          continue;
-        const prerequisitesSection = ctx.isPrerequisiteFor.length > 0 ? ctx.isPrerequisiteFor.map((c) => `- [[${c}]]`).join("\n") : "- *Not yet documented - research via Oracle*";
-        const leadsToSection = ctx.leadsTo.length > 0 ? ctx.leadsTo.map((c) => `- [[${c}]]`).join("\n") : "- *Not yet documented - research via Oracle*";
-        const countersSection = ctx.counteredBy.length > 0 ? ctx.counteredBy.map((c) => `- [[${c}]]`).join("\n") : "- *Not yet documented - research via Oracle*";
-        const relatedSection = [
-          ...ctx.relatedTo.map((c) => `- [[${c}]]`),
-          ...ctx.parentOf.map((c) => `- [[${c}]]`),
-          ...ctx.childOf.map((c) => `- [[${c}]]`)
-        ].join("\n") || "- *Not yet documented*";
-        const stubContent = `---
-type: concept
-tier: "stub"
-tags: [concept, bjj, stub, priority/tier3]
+      for (const cp of checkpoints) {
+        const cpName = normalizeName(cp.name);
+        const order = cp.order || 1;
+        for (const inv of cp.invariables || []) {
+          const invName = normalizeName(inv.name);
+          if (!invName || createdNames.has(invName.toLowerCase()))
+            continue;
+          const invPath = `${conceptsFolder}/${invName}.md`;
+          if (this.app.vault.getAbstractFileByPath(invPath)) {
+            createdNames.add(invName.toLowerCase());
+            continue;
+          }
+          const tier = inv.tier || "tier3";
+          const tierLabel = tier === "tier1" ? "CRITICAL" : tier === "tier2" ? "IMPORTANT" : "REFINEMENT";
+          const siblings = (cp.invariables || []).filter((i) => normalizeName(i.name).toLowerCase() !== invName.toLowerCase()).map((i) => `[[${clusterName}/${normalizeName(i.name)}|${normalizeName(i.name)}]]`).join(" \xB7 ");
+          const content = `---
+type: invariable
+tier: "${tier}"
+checkpoint: "${cpName}"
+checkpoint_order: ${order}
+cluster: "${clusterName}"
+tags: [grappling, invariable, ${tier}${topicTagsStr ? ", " + topicTagsStr : ""}]
 source_file: "${file.basename}"
 source_rlm_session: "${sourceRlmSessionId}"
 ---
 
-# ${linkedName}
+# ${invName}
 
-> [!info] Research This Concept
-> Use Oracle to research "${linkedName}" and expand this node with real content from your video library.
+> [!${tier === "tier1" ? "danger" : tier === "tier2" ? "warning" : "info"}] ${tierLabel} INVARIABLE
+> Part of [[${clusterName}/${cpName}|Checkpoint ${order}: ${cpName}]]
 
-## Summary
+## WHY
 
-*Research this concept via Oracle to add summary from your instructional content.*
+> ${inv.why || "See parent article."}
 
-## Prerequisites
+## HOW
 
-${prerequisitesSection}
+${inv.how || "No explanation."}
 
-## Leads To
+## FEEL
 
-${leadsToSection}
+> ${inv.feel || "No feel description."}
 
-## Counters
+---
 
-${countersSection}
+## Do Together With
 
-## Related Concepts
+${siblings || "*Only invariable at this checkpoint*"}
 
-${relatedSection}
+## Parent
 
-## Training Drills
-
-*Right-click \u2192 "Get Training Drills" to search your video library for exercises.*
+[[${clusterName}/${cpName}|< ${cpName}]]
 `;
-        await this.app.vault.create(stubPath, stubContent);
-        stubCount++;
+          await this.app.vault.create(invPath, content);
+          createdNames.add(invName.toLowerCase());
+          createdCount++;
+        }
       }
-      const totalCreated = createdCount + stubCount;
-      new import_obsidian.Notice(`Created ${createdCount} concepts + ${stubCount} linked stubs! Open Graph View.`, 5e3);
+      for (const cp of checkpoints) {
+        const cpName = normalizeName(cp.name);
+        const order = cp.order || 1;
+        for (const v of cp.variables || []) {
+          const vName = normalizeName(v.name);
+          if (!vName || createdNames.has(vName.toLowerCase()))
+            continue;
+          const vPath = `${conceptsFolder}/${vName}.md`;
+          if (this.app.vault.getAbstractFileByPath(vPath)) {
+            createdNames.add(vName.toLowerCase());
+            continue;
+          }
+          const content = `---
+type: variable
+trigger: "${v.trigger || ""}"
+checkpoint: "${cpName}"
+checkpoint_order: ${order}
+cluster: "${clusterName}"
+tags: [grappling, variable${topicTagsStr ? ", " + topicTagsStr : ""}]
+source_file: "${file.basename}"
+source_rlm_session: "${sourceRlmSessionId}"
+---
+
+# ${vName}
+
+> [!warning] VARIABLE - Situational Response
+> Part of [[${clusterName}/${cpName}|Checkpoint ${order}: ${cpName}]]
+
+## TRIGGER
+
+> **${v.trigger || "When opponent reacts"}**
+
+## ACTION
+
+${v.action || "No action described."}
+
+## WHY This Works
+
+> ${v.why || "See parent article."}
+
+---
+
+## Parent
+
+[[${clusterName}/${cpName}|< ${cpName}]]
+`;
+          await this.app.vault.create(vPath, content);
+          createdNames.add(vName.toLowerCase());
+          createdCount++;
+        }
+      }
+      const clusterTag = `cluster/${clusterName.toLowerCase().replace(/\s+/g, "-")}`;
+      const indexPath = `${conceptsBase}/${clusterName}.md`;
+      const cpList = checkpoints.map((cp) => {
+        const cpName = normalizeName(cp.name);
+        const invCount = (cp.invariables || []).length;
+        const varCount = (cp.variables || []).length;
+        return `${cp.order || 1}. [[${clusterName}/${cpName}|${cpName}]] (${invCount} inv, ${varCount} var)`;
+      }).join("\n");
+      const totalInv = checkpoints.reduce((sum, cp) => sum + (cp.invariables || []).length, 0);
+      const totalVar = checkpoints.reduce((sum, cp) => sum + (cp.variables || []).length, 0);
+      let mermaidFlow = "flowchart LR\n";
+      for (let i = 0; i < checkpoints.length; i++) {
+        const cp = checkpoints[i];
+        const cpId = `CP${i + 1}`;
+        const cpName = normalizeName(cp.name).replace(/"/g, "");
+        mermaidFlow += `    ${cpId}["[${i + 1}] ${cpName}"]
+`;
+      }
+      for (let i = 0; i < checkpoints.length - 1; i++) {
+        mermaidFlow += `    CP${i + 1} --> CP${i + 2}
+`;
+      }
+      const indexContent = `---
+type: sequence
+cluster: "${clusterName}"
+tags: [cluster, grappling, sequence, ${clusterTag}]
+source_file: "${file.basename}"
+checkpoints_count: ${checkpoints.length}
+invariables_count: ${totalInv}
+variables_count: ${totalVar}
+---
+
+# ${clusterName}
+
+> [!tip] Sequential Checkpoints with Invariables and Variables
+
+**Source:** [[${file.basename}]]
+**Checkpoints:** ${checkpoints.length} | **Invariables:** ${totalInv} | **Variables:** ${totalVar}
+
+---
+
+## Flow Diagram
+
+\`\`\`mermaid
+${mermaidFlow}\`\`\`
+
+---
+
+## The Sequence
+
+${cpList}
+
+---
+
+## How It Works
+
+1. **Checkpoints** = Sequential milestones (complete 1 before 2)
+2. **Invariables** = Always do (tiered by priority, do together)
+3. **Variables** = IF/THEN responses at each checkpoint
+`;
+      if (!this.app.vault.getAbstractFileByPath(indexPath)) {
+        await this.app.vault.create(indexPath, indexContent);
+      }
+      const canvasPath = `${conceptsBase}/${clusterName}.canvas`;
+      if (!this.app.vault.getAbstractFileByPath(canvasPath)) {
+        const nodes = [];
+        const edges = [];
+        let nodeId = 1;
+        const cpWidth = 280;
+        const cpHeight = 80;
+        const conceptWidth = 220;
+        const conceptHeight = 60;
+        const cpSpacing = 350;
+        const verticalGap = 100;
+        const cpNodeIds = [];
+        for (let i = 0; i < checkpoints.length; i++) {
+          const cp = checkpoints[i];
+          const cpName = normalizeName(cp.name);
+          const cpId = `cp-${nodeId++}`;
+          cpNodeIds.push(cpId);
+          nodes.push({
+            id: cpId,
+            type: "file",
+            file: `${conceptsFolder}/${cpName}.md`,
+            x: i * cpSpacing,
+            y: 0,
+            width: cpWidth,
+            height: cpHeight,
+            color: "6"
+          });
+          const invariables = cp.invariables || [];
+          for (let j = 0; j < invariables.length; j++) {
+            const inv = invariables[j];
+            const invName = normalizeName(inv.name);
+            const invId = `inv-${nodeId++}`;
+            const tier = inv.tier || "tier3";
+            const color = tier === "tier1" ? "1" : tier === "tier2" ? "3" : "4";
+            nodes.push({
+              id: invId,
+              type: "file",
+              file: `${conceptsFolder}/${invName}.md`,
+              x: i * cpSpacing + j * 120 - (invariables.length - 1) * 60,
+              y: cpHeight + verticalGap,
+              width: conceptWidth,
+              height: conceptHeight,
+              color
+            });
+            edges.push({
+              id: `edge-${nodeId++}`,
+              fromNode: cpId,
+              toNode: invId,
+              fromSide: "bottom",
+              toSide: "top"
+            });
+          }
+          const variables = cp.variables || [];
+          for (let k = 0; k < variables.length; k++) {
+            const v = variables[k];
+            const vName = normalizeName(v.name);
+            const vId = `var-${nodeId++}`;
+            nodes.push({
+              id: vId,
+              type: "file",
+              file: `${conceptsFolder}/${vName}.md`,
+              x: i * cpSpacing + k * 120 - (variables.length - 1) * 60,
+              y: cpHeight + verticalGap * 2 + conceptHeight,
+              width: conceptWidth,
+              height: conceptHeight,
+              color: "2"
+            });
+            edges.push({
+              id: `edge-${nodeId++}`,
+              fromNode: cpId,
+              toNode: vId,
+              fromSide: "bottom",
+              toSide: "top"
+            });
+          }
+        }
+        for (let i = 0; i < cpNodeIds.length - 1; i++) {
+          edges.push({
+            id: `edge-${nodeId++}`,
+            fromNode: cpNodeIds[i],
+            toNode: cpNodeIds[i + 1],
+            fromSide: "right",
+            toSide: "left"
+          });
+        }
+        const canvasContent = JSON.stringify({ nodes, edges }, null, 2);
+        await this.app.vault.create(canvasPath, canvasContent);
+      }
+      new import_obsidian.Notice(`Created "${clusterName}": ${checkpoints.length} checkpoints + Canvas timeline!`, 5e3);
     } catch (error) {
       console.error("Explode to Concept Graph error:", error);
       new import_obsidian.Notice("Failed to explode concepts. Check console.", 5e3);
@@ -1961,6 +3469,58 @@ ${updatedFrontmatter}
     } catch (error) {
       console.error("Get Training Drills error:", error);
       new import_obsidian.Notice("Failed to get training drills. Check console.", 5e3);
+    }
+  }
+  // Research a concept - dive deeper via Oracle RLM
+  async researchConcept(file) {
+    const content = await this.app.vault.read(file);
+    const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!frontmatterMatch) {
+      new import_obsidian.Notice("No frontmatter found");
+      return;
+    }
+    const frontmatter = frontmatterMatch[1];
+    const conceptName = file.basename;
+    const sessionMatch = frontmatter.match(/source_rlm_session:\s*"([^"]+)"/);
+    const rlmSessionId = sessionMatch ? sessionMatch[1] : "";
+    new import_obsidian.Notice(`Researching: ${conceptName}...`, 3e3);
+    try {
+      const oracleUrl = "http://localhost:5002";
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${oracleUrl}/api/internal/deep-dive`,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: rlmSessionId || `concept_${conceptName}`,
+          focus_text: `${conceptName}: key details, variations, common mistakes, and important nuances`
+        })
+      });
+      const result = response.json;
+      if (result.error) {
+        new import_obsidian.Notice(`Research failed: ${result.error}`, 5e3);
+        return;
+      }
+      const research = result.deep_dive_raw || result.deep_dive_html;
+      const sourcesCount = result.new_sources_count || 0;
+      if (!research || sourcesCount === 0) {
+        new import_obsidian.Notice(`No content found for "${conceptName}" in your library`, 5e3);
+        return;
+      }
+      const timestamp = new Date().toLocaleTimeString();
+      const researchSection = `
+
+---
+## Research Findings
+*Found ${sourcesCount} sources at ${timestamp}*
+
+${research}
+`;
+      const updatedContent = content + researchSection;
+      await this.app.vault.modify(file, updatedContent);
+      new import_obsidian.Notice(`Added research for: ${conceptName} (${sourcesCount} sources)`, 5e3);
+    } catch (error) {
+      console.error("Research concept error:", error);
+      new import_obsidian.Notice("Research failed. Is Oracle running?", 5e3);
     }
   }
   // Generate Skill Development sessions from selected text (right-click context menu)
@@ -2247,6 +3807,77 @@ ${sourceLinkBody}
     } catch (error) {
       console.error("Sync error:", error);
       new import_obsidian.Notice("Sync failed - check console for details");
+    }
+  }
+  // Sync shared concept from coach and open it (called from Discord link)
+  async syncAndOpenConcept(conceptName) {
+    new import_obsidian.Notice(`Syncing "${conceptName}" from coach...`);
+    try {
+      if (this.settings.mode === "remote" && this.settings.athleteToken) {
+        const response = await (0, import_obsidian.requestUrl)({
+          url: `${this.settings.queueServiceUrl}/api/queue/shared-concepts`,
+          method: "GET",
+          headers: { "Authorization": `Bearer ${this.settings.athleteToken}` }
+        });
+        const sharedConcepts = response.json.shared_concepts || [];
+        const concept = sharedConcepts.find(
+          (c) => c.name === conceptName || c.name.includes(conceptName)
+        );
+        if (concept) {
+          const conceptsBase = `${this.settings.syncFolder}/${this.settings.conceptsSubfolder}`;
+          await this.ensureFolder(conceptsBase);
+          const data = concept.data || {};
+          if (data.type === "cluster" && data.clusterName) {
+            const clusterFolder = `${conceptsBase}/${data.clusterName}`;
+            await this.ensureFolder(clusterFolder);
+            const indexPath = `${conceptsBase}/${data.clusterName}.md`;
+            if (data.indexContent) {
+              await this.saveNote(indexPath, data.indexContent);
+            }
+            for (const c of data.concepts || []) {
+              const filePath2 = `${clusterFolder}/${c.name}.md`;
+              await this.saveNote(filePath2, c.content);
+            }
+            new import_obsidian.Notice(`Synced "${conceptName}" - opening...`);
+            await this.app.workspace.openLinkText(indexPath, "", true);
+          } else if (data.type === "concept" && data.content) {
+            const filePath2 = `${conceptsBase}/${conceptName}.md`;
+            await this.saveNote(filePath2, data.content);
+            new import_obsidian.Notice(`Synced "${conceptName}" - opening...`);
+            await this.app.workspace.openLinkText(filePath2, "", true);
+          } else {
+            const filePath2 = `${conceptsBase}/${conceptName}.md`;
+            const stubContent = `---
+type: shared-concept
+from_oracle: true
+shared_at: "${concept.shared_at || new Date().toISOString()}"
+---
+
+# ${conceptName}
+
+${concept.summary || "Concept shared from Oracle."}
+
+---
+*Full content pending - sync with Oracle for details.*
+`;
+            await this.saveNote(filePath2, stubContent);
+            new import_obsidian.Notice(`Synced "${conceptName}" - opening...`);
+            await this.app.workspace.openLinkText(filePath2, "", true);
+          }
+          return;
+        }
+      }
+      const filePath = `${this.settings.syncFolder}/${this.settings.conceptsSubfolder}/${conceptName}.md`;
+      const file = this.app.vault.getAbstractFileByPath(filePath);
+      if (file instanceof import_obsidian.TFile) {
+        await this.app.workspace.openLinkText(filePath, "", true);
+        new import_obsidian.Notice(`Opened "${conceptName}"`);
+      } else {
+        new import_obsidian.Notice(`Concept "${conceptName}" not found. Sync with Oracle first.`);
+      }
+    } catch (error) {
+      console.error("Sync and open error:", error);
+      new import_obsidian.Notice(`Failed to sync: ${error.message}`);
     }
   }
   async ensureFoldersExist(paths) {
@@ -2742,7 +4373,7 @@ var VoiceNoteModal = class extends import_obsidian.Modal {
     try {
       const audioBlob = new Blob(this.audioChunks, { type: "audio/webm" });
       if (this.plugin.settings.mode === "remote" && this.plugin.settings.athleteToken) {
-        this.statusEl.setText("Transcribing via cloud (30s max, 5/day)...");
+        this.statusEl.setText("Transcribing via cloud (2min max, 5/day)...");
         try {
           const result = await this.plugin.remoteTranscribe(audioBlob);
           const usageInfo = `(${result.usage.remaining} voice notes remaining today)`;
@@ -2753,8 +4384,8 @@ var VoiceNoteModal = class extends import_obsidian.Modal {
             this.statusEl.setText("Daily voice note limit reached (5/day)");
             new import_obsidian.Notice("You have used all 5 voice notes for today. Try again tomorrow!");
           } else if (error.message.includes("too long")) {
-            this.statusEl.setText("Recording too long (max 30 seconds)");
-            new import_obsidian.Notice("Voice notes are limited to 30 seconds. Please record a shorter message.");
+            this.statusEl.setText("Recording too long (max 2 minutes)");
+            new import_obsidian.Notice("Voice notes are limited to 2 minutes. Please record a shorter message.");
           } else {
             throw error;
           }
@@ -3183,7 +4814,7 @@ ${transcript}
       const audioUrl = `${this.plugin.settings.serverUrl}${session.response_audio_url}`;
       const audio = new Audio(audioUrl);
       audio.play().catch((err) => console.error("Audio error:", err));
-      this.statusEl.setText("Coach is speaking...");
+      this.statusEl.setText("Oracle is speaking...");
       this.statusEl.style.color = "var(--text-accent)";
       audio.onended = () => {
         this.statusEl.setText("Your turn - record your answer");
@@ -3205,13 +4836,13 @@ ${transcript}
     questionText.style.textAlign = "center";
     if (session.state === "RESEARCHING") {
       const isRemote = this.plugin.isRemoteMode();
-      this.statusEl.setText(isRemote ? "Ready to send to coach!" : "Ready to generate wisdom!");
+      this.statusEl.setText(isRemote ? "Ready to send to Oracle!" : "Ready to generate wisdom!");
       this.statusEl.style.color = "var(--text-success)";
       const bigBtnContainer = this.resultEl.createDiv();
       bigBtnContainer.style.textAlign = "center";
       bigBtnContainer.style.marginTop = "30px";
       const generateBtn = bigBtnContainer.createEl("button", {
-        text: isRemote ? "\u{1F4E4} Send to Coach" : "\u2728 Generate Wisdom",
+        text: isRemote ? "\u{1F4E4} Send to Oracle" : "\u2728 Generate Wisdom",
         cls: "mod-cta"
       });
       generateBtn.style.fontSize = "1.4em";
@@ -3230,7 +4861,7 @@ ${transcript}
           };
           const jobId = await plugin.submitToCoach(topic, therapyContext);
           if (jobId) {
-            new import_obsidian.Notice("Query sent to coach! Check back later for results.", 5e3);
+            new import_obsidian.Notice("Query sent to Oracle! Check back later for results.", 5e3);
           }
           this.close();
           return;
@@ -3951,7 +5582,7 @@ ${clipEmbeds.join("\n\n")}
             let researchLink = "";
             if (this.savedFilePath) {
               const researchFileName = ((_a = this.savedFilePath.split("/").pop()) == null ? void 0 : _a.replace(".md", "")) || "";
-              researchLink = `> \u{1F4DA} **Based on research:** [[${researchFileName}]]
+              researchLink = `> **Based on research:** [[${researchFileName}]]
 
 `;
             }
@@ -4097,6 +5728,1826 @@ var CoachAddAthleteModal = class extends import_obsidian.Modal {
         new import_obsidian.Notice("Failed to add athlete");
       }
     }));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var AthleteSelectModal = class extends import_obsidian.Modal {
+  constructor(app, athletes, onSelect) {
+    super(app);
+    this.athletes = athletes;
+    this.onSelect = onSelect;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: "Select Athlete" });
+    contentEl.createEl("p", { text: "Choose an athlete to share this content with:" });
+    const listEl = contentEl.createEl("div", { cls: "athlete-select-list" });
+    for (const athlete of this.athletes) {
+      const athleteEl = listEl.createEl("div", { cls: "athlete-select-item" });
+      athleteEl.style.cssText = "padding: 10px; margin: 5px 0; border-radius: 5px; cursor: pointer; background: var(--background-secondary);";
+      const name = athlete.display_name || athlete.discord_username || `Athlete ${athlete.id}`;
+      athleteEl.createEl("strong", { text: name });
+      if (athlete.discord_username && athlete.discord_username !== name) {
+        athleteEl.createEl("span", {
+          text: ` (@${athlete.discord_username})`,
+          cls: "athlete-discord-name"
+        });
+      }
+      athleteEl.addEventListener("click", () => {
+        this.onSelect(athlete);
+        this.close();
+      });
+      athleteEl.addEventListener("mouseenter", () => {
+        athleteEl.style.background = "var(--background-modifier-hover)";
+      });
+      athleteEl.addEventListener("mouseleave", () => {
+        athleteEl.style.background = "var(--background-secondary)";
+      });
+    }
+    new import_obsidian.Setting(contentEl).addButton((btn) => btn.setButtonText("Cancel").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var ArticleBibliographyModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, bibliographyData, sourceFile) {
+    super(app);
+    this.plugin = plugin;
+    this.bibliographyData = bibliographyData;
+    this.sourceFile = sourceFile;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    const { bibliographyData } = this;
+    contentEl.createEl("h2", { text: "Article Source Videos" });
+    const queryEl = contentEl.createEl("div", { cls: "original-query" });
+    queryEl.style.cssText = "margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px; border-left: 3px solid var(--interactive-accent);";
+    queryEl.createEl("p", {
+      text: `Original Question: "${bibliographyData.original_query}"`,
+      cls: "query-text"
+    });
+    const statsEl = contentEl.createEl("div", { cls: "bibliography-stats" });
+    statsEl.style.cssText = "margin-bottom: 15px; display: flex; gap: 15px;";
+    statsEl.createEl("span", { text: `\u{1F4F9} ${bibliographyData.total_videos} videos` });
+    statsEl.createEl("span", { text: `\u{1F464} ${bibliographyData.instructors.length} instructors` });
+    contentEl.createEl("p", {
+      text: "Click any video to view its full concept cache with timestamps:",
+      cls: "bibliography-instructions"
+    });
+    const listEl = contentEl.createEl("div", { cls: "videos-list" });
+    listEl.style.cssText = "max-height: 450px; overflow-y: auto;";
+    const byInstructor = {};
+    for (const video of bibliographyData.videos) {
+      const instructor = video.instructor || "Unknown";
+      if (!byInstructor[instructor]) {
+        byInstructor[instructor] = [];
+      }
+      byInstructor[instructor].push(video);
+    }
+    for (const instructor of Object.keys(byInstructor).sort()) {
+      const groupEl = listEl.createEl("div", { cls: "instructor-group" });
+      groupEl.style.cssText = "margin-bottom: 15px;";
+      const headerEl = groupEl.createEl("h3", { text: `\u{1F464} ${instructor}` });
+      headerEl.style.cssText = "margin: 10px 0 5px 0; font-size: 1.1em; color: var(--text-accent);";
+      for (const video of byInstructor[instructor]) {
+        const videoEl = groupEl.createEl("div", { cls: "video-item" });
+        videoEl.style.cssText = "padding: 10px; margin: 5px 0; border-radius: 5px; background: var(--background-secondary); cursor: pointer; border-left: 3px solid var(--interactive-accent);";
+        const titleRow = videoEl.createEl("div", { cls: "title-row" });
+        titleRow.style.cssText = "display: flex; justify-content: space-between; align-items: center;";
+        titleRow.createEl("strong", { text: video.video_title });
+        const citationsBadge = titleRow.createEl("span", { cls: "citations-badge" });
+        citationsBadge.style.cssText = "background: var(--interactive-accent); color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8em;";
+        citationsBadge.textContent = `${video.citations_count} citation${video.citations_count !== 1 ? "s" : ""}`;
+        if (video.timestamps && video.timestamps.length > 0) {
+          const timestampsEl = videoEl.createEl("div", { cls: "timestamps-preview" });
+          timestampsEl.style.cssText = "margin-top: 5px; font-size: 0.85em; color: var(--text-muted);";
+          timestampsEl.textContent = `Timestamps: ${video.timestamps.slice(0, 5).join(", ")}${video.timestamps.length > 5 ? "..." : ""}`;
+        }
+        videoEl.addEventListener("click", async () => {
+          videoEl.style.background = "var(--background-modifier-hover)";
+          titleRow.createEl("span", { text: " Loading...", cls: "loading-text" });
+          try {
+            const response = await (0, import_obsidian.requestUrl)({
+              url: `${this.plugin.settings.serverUrl}/api/obsidian/explore-video`,
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${this.plugin.settings.apiToken}`
+              },
+              body: JSON.stringify({
+                video_id: video.video_id,
+                concept: video.video_title
+                // Use video title as fallback
+              })
+            });
+            const data = response.json;
+            if (data.error) {
+              new import_obsidian.Notice(`Could not load concept cache for this video`, 3e3);
+              videoEl.style.background = "var(--background-secondary)";
+              const loadingText = videoEl.querySelector(".loading-text");
+              if (loadingText)
+                loadingText.remove();
+              return;
+            }
+            this.close();
+            const modal = new VideoExplorerModal(
+              this.app,
+              this.plugin,
+              data,
+              this.sourceFile
+            );
+            modal.open();
+          } catch (error) {
+            new import_obsidian.Notice(`Failed to load: ${error.message}`, 3e3);
+            videoEl.style.background = "var(--background-secondary)";
+            const loadingText = videoEl.querySelector(".loading-text");
+            if (loadingText)
+              loadingText.remove();
+          }
+        });
+        videoEl.addEventListener("mouseenter", () => {
+          videoEl.style.background = "var(--background-modifier-hover)";
+        });
+        videoEl.addEventListener("mouseleave", () => {
+          videoEl.style.background = "var(--background-secondary)";
+        });
+      }
+    }
+    const footerEl = contentEl.createEl("div", { cls: "modal-footer" });
+    footerEl.style.cssText = "margin-top: 20px; display: flex; gap: 10px;";
+    new import_obsidian.Setting(footerEl).addButton((btn) => btn.setButtonText("Close").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var CatalogBrowserModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, concept, conceptContext, sourceFile) {
+    super(app);
+    this.selectedVideos = /* @__PURE__ */ new Set();
+    this.catalogData = null;
+    this.plugin = plugin;
+    this.concept = concept;
+    this.conceptContext = conceptContext;
+    this.sourceFile = sourceFile;
+  }
+  async onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: "Cross-Reference Research" });
+    const conceptEl = contentEl.createEl("div", { cls: "concept-info" });
+    conceptEl.style.cssText = "margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px; border-left: 3px solid var(--interactive-accent);";
+    conceptEl.createEl("p", { text: `Concept: "${this.concept}"` });
+    if (this.conceptContext) {
+      conceptEl.createEl("p", { text: `Context: ${this.conceptContext}`, cls: "context-text" });
+    }
+    const loadingEl = contentEl.createEl("div", { cls: "loading", text: "Loading video catalog..." });
+    loadingEl.style.cssText = "padding: 20px; text-align: center;";
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.plugin.settings.serverUrl}/api/obsidian/catalog`,
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${this.plugin.settings.apiToken}`
+        }
+      });
+      this.catalogData = response.json;
+      loadingEl.remove();
+      contentEl.createEl("p", {
+        text: `Select videos to cross-reference (${this.catalogData.total_videos} available):`,
+        cls: "catalog-instructions"
+      });
+      const selectedCountEl = contentEl.createEl("div", { cls: "selected-count" });
+      selectedCountEl.style.cssText = "margin-bottom: 10px; font-weight: bold; color: var(--text-accent);";
+      selectedCountEl.textContent = "0 videos selected";
+      const searchEl = contentEl.createEl("input", { type: "text", placeholder: "Filter instructors/series..." });
+      searchEl.style.cssText = "width: 100%; padding: 8px; margin-bottom: 10px; border-radius: 5px; border: 1px solid var(--background-modifier-border);";
+      const listEl = contentEl.createEl("div", { cls: "catalog-list" });
+      listEl.style.cssText = "max-height: 350px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: 5px; padding: 10px;";
+      const updateSelectedCount = () => {
+        selectedCountEl.textContent = `${this.selectedVideos.size} videos selected`;
+      };
+      const renderCatalog = (filter = "") => {
+        listEl.empty();
+        const filterLower = filter.toLowerCase();
+        for (const instructor of this.catalogData.instructors) {
+          const instructorMatches = instructor.name.toLowerCase().includes(filterLower);
+          const matchingSeries = instructor.series.filter(
+            (s) => instructorMatches || s.name.toLowerCase().includes(filterLower)
+          );
+          if (matchingSeries.length === 0 && !instructorMatches)
+            continue;
+          const groupEl = listEl.createEl("div", { cls: "instructor-group" });
+          groupEl.style.cssText = "margin-bottom: 10px;";
+          const headerEl = groupEl.createEl("div", { cls: "instructor-header" });
+          headerEl.style.cssText = "display: flex; align-items: center; gap: 8px; cursor: pointer; padding: 5px; background: var(--background-secondary); border-radius: 3px;";
+          const expandIcon = headerEl.createEl("span", { text: "\u25B6" });
+          expandIcon.style.cssText = "font-size: 0.8em; transition: transform 0.2s;";
+          const instructorCheckbox = headerEl.createEl("input", { type: "checkbox" });
+          instructorCheckbox.style.cssText = "margin-right: 5px;";
+          headerEl.createEl("strong", { text: `${instructor.name} (${instructor.video_count})` });
+          const seriesContainer = groupEl.createEl("div", { cls: "series-container" });
+          seriesContainer.style.cssText = "display: none; margin-left: 20px; margin-top: 5px;";
+          headerEl.addEventListener("click", (e) => {
+            if (e.target === instructorCheckbox)
+              return;
+            const isExpanded = seriesContainer.style.display !== "none";
+            seriesContainer.style.display = isExpanded ? "none" : "block";
+            expandIcon.style.transform = isExpanded ? "" : "rotate(90deg)";
+          });
+          const seriesToRender = instructorMatches ? instructor.series : matchingSeries;
+          for (const series of seriesToRender) {
+            const seriesEl = seriesContainer.createEl("div", { cls: "series-item" });
+            seriesEl.style.cssText = "margin: 5px 0; padding: 5px; border-left: 2px solid var(--background-modifier-border);";
+            const seriesHeader = seriesEl.createEl("div", { cls: "series-header" });
+            seriesHeader.style.cssText = "display: flex; align-items: center; gap: 5px;";
+            const seriesCheckbox = seriesHeader.createEl("input", { type: "checkbox" });
+            seriesHeader.createEl("span", { text: `${series.name} (${series.video_count})` });
+            const videosEl = seriesEl.createEl("div", { cls: "videos-list" });
+            videosEl.style.cssText = "margin-left: 20px; font-size: 0.9em;";
+            const videoCheckboxes = [];
+            for (const video of series.videos) {
+              const videoEl = videosEl.createEl("div", { cls: "video-item" });
+              videoEl.style.cssText = "display: flex; align-items: center; gap: 5px; padding: 2px 0;";
+              const videoCheckbox = videoEl.createEl("input", { type: "checkbox" });
+              videoCheckbox.dataset.videoId = video.video_id;
+              videoCheckboxes.push(videoCheckbox);
+              if (this.selectedVideos.has(video.video_id)) {
+                videoCheckbox.checked = true;
+              }
+              videoCheckbox.addEventListener("change", () => {
+                if (videoCheckbox.checked) {
+                  this.selectedVideos.add(video.video_id);
+                } else {
+                  this.selectedVideos.delete(video.video_id);
+                }
+                updateSelectedCount();
+              });
+              const volText = video.volume ? ` (Vol ${video.volume})` : "";
+              videoEl.createEl("span", { text: video.title + volText });
+            }
+            seriesCheckbox.addEventListener("change", () => {
+              for (const cb of videoCheckboxes) {
+                cb.checked = seriesCheckbox.checked;
+                if (seriesCheckbox.checked) {
+                  this.selectedVideos.add(cb.dataset.videoId);
+                } else {
+                  this.selectedVideos.delete(cb.dataset.videoId);
+                }
+              }
+              updateSelectedCount();
+            });
+          }
+          instructorCheckbox.addEventListener("change", () => {
+            const allCheckboxes = seriesContainer.querySelectorAll('input[type="checkbox"]');
+            allCheckboxes.forEach((cb) => {
+              cb.checked = instructorCheckbox.checked;
+              if (cb.dataset.videoId) {
+                if (instructorCheckbox.checked) {
+                  this.selectedVideos.add(cb.dataset.videoId);
+                } else {
+                  this.selectedVideos.delete(cb.dataset.videoId);
+                }
+              }
+            });
+            updateSelectedCount();
+          });
+        }
+      };
+      renderCatalog();
+      searchEl.addEventListener("input", () => {
+        renderCatalog(searchEl.value);
+      });
+      const footerEl = contentEl.createEl("div", { cls: "modal-footer" });
+      footerEl.style.cssText = "margin-top: 15px; display: flex; gap: 10px; justify-content: flex-end;";
+      new import_obsidian.Setting(footerEl).addButton((btn) => btn.setButtonText("Run Cross-Reference").setCta().onClick(async () => {
+        if (this.selectedVideos.size === 0) {
+          new import_obsidian.Notice("Select at least one video to cross-reference");
+          return;
+        }
+        btn.setButtonText("Researching...");
+        btn.setDisabled(true);
+        try {
+          const response2 = await (0, import_obsidian.requestUrl)({
+            url: `${this.plugin.settings.serverUrl}/api/obsidian/cross-reference`,
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${this.plugin.settings.apiToken}`
+            },
+            body: JSON.stringify({
+              concept: this.concept,
+              concept_context: this.conceptContext,
+              video_ids: Array.from(this.selectedVideos)
+            })
+          });
+          const data = response2.json;
+          if (data.error) {
+            new import_obsidian.Notice(`Error: ${data.error}`);
+            btn.setButtonText("Run Cross-Reference");
+            btn.setDisabled(false);
+            return;
+          }
+          this.close();
+          const resultsModal = new CrossReferenceResultsModal(
+            this.app,
+            this.plugin,
+            data,
+            this.sourceFile
+          );
+          resultsModal.open();
+        } catch (error) {
+          new import_obsidian.Notice(`Failed: ${error.message}`);
+          btn.setButtonText("Run Cross-Reference");
+          btn.setDisabled(false);
+        }
+      })).addButton((btn) => btn.setButtonText("Cancel").onClick(() => this.close()));
+    } catch (error) {
+      loadingEl.textContent = `Failed to load catalog: ${error.message}`;
+    }
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var CrossReferenceResultsModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, resultsData, sourceFile) {
+    super(app);
+    this.plugin = plugin;
+    this.resultsData = resultsData;
+    this.sourceFile = sourceFile;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    const { resultsData } = this;
+    contentEl.createEl("h2", { text: "\u{1F4CA} Cross-Reference Results" });
+    const statsEl = contentEl.createEl("div", { cls: "results-stats" });
+    statsEl.style.cssText = "margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px;";
+    statsEl.createEl("p", { text: `Concept: "${resultsData.concept}"` });
+    statsEl.createEl("p", { text: `\u{1F4F9} ${resultsData.videos_analyzed} videos analyzed` });
+    statsEl.createEl("p", { text: `\u{1F9E0} ${resultsData.thinkers_used} thinker perspectives used` });
+    const sourcesEl = contentEl.createEl("div", { cls: "sources-used" });
+    sourcesEl.style.cssText = "margin-bottom: 15px;";
+    sourcesEl.createEl("h4", { text: "Sources Cross-Referenced:" });
+    const sourcesList = sourcesEl.createEl("ul");
+    for (const src of resultsData.sources) {
+      sourcesList.createEl("li", { text: `${src.instructor} - ${src.video_name}` });
+    }
+    const researchEl = contentEl.createEl("div", { cls: "research-content" });
+    researchEl.style.cssText = "max-height: 400px; overflow-y: auto; padding: 15px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: 5px; white-space: pre-wrap; font-family: var(--font-text);";
+    researchEl.textContent = resultsData.research;
+    const footerEl = contentEl.createEl("div", { cls: "modal-footer" });
+    footerEl.style.cssText = "margin-top: 15px; display: flex; gap: 10px;";
+    new import_obsidian.Setting(footerEl).addButton((btn) => btn.setButtonText("Save to Note").setCta().onClick(async () => {
+      var _a;
+      const fileName = `Cross-Reference - ${resultsData.concept.substring(0, 30)}.md`;
+      const folderPath = ((_a = this.sourceFile.parent) == null ? void 0 : _a.path) || this.plugin.settings.syncFolder;
+      const filePath = `${folderPath}/${fileName}`;
+      const content = `---
+type: cross-reference
+concept: "${resultsData.concept}"
+videos_analyzed: ${resultsData.videos_analyzed}
+thinkers_used: ${resultsData.thinkers_used}
+date: ${new Date().toISOString().split("T")[0]}
+---
+
+# Cross-Reference: ${resultsData.concept}
+
+## Sources Analyzed
+${resultsData.sources.map((s) => `- ${s.instructor} - ${s.video_name}`).join("\n")}
+
+## Research
+
+${resultsData.research}
+`;
+      try {
+        await this.app.vault.create(filePath, content);
+        new import_obsidian.Notice(`Saved to ${fileName}`);
+        this.close();
+        const newFile = this.app.vault.getAbstractFileByPath(filePath);
+        if (newFile instanceof import_obsidian.TFile) {
+          await this.app.workspace.getLeaf().openFile(newFile);
+        }
+      } catch (error) {
+        new import_obsidian.Notice(`Failed to save: ${error.message}`);
+      }
+    })).addButton((btn) => btn.setButtonText("Copy to Clipboard").onClick(async () => {
+      await navigator.clipboard.writeText(resultsData.research);
+      new import_obsidian.Notice("Copied to clipboard!");
+    })).addButton((btn) => btn.setButtonText("Close").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var EnrichCheckpointModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, checkpointData, sourceFile) {
+    super(app);
+    this.selectedVideos = /* @__PURE__ */ new Set();
+    this.catalogData = null;
+    this.plugin = plugin;
+    this.checkpointData = checkpointData;
+    this.sourceFile = sourceFile;
+  }
+  async onOpen() {
+    const { contentEl } = this;
+    const { checkpointData } = this;
+    contentEl.createEl("h2", { text: "RLM Checkpoint Enrichment" });
+    const infoEl = contentEl.createEl("div", { cls: "checkpoint-info" });
+    infoEl.style.cssText = "margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px; border-left: 3px solid var(--text-accent);";
+    infoEl.createEl("h3", { text: checkpointData.name });
+    infoEl.createEl("p", { text: `Cluster: ${checkpointData.cluster}` });
+    const currentEl = contentEl.createEl("div", { cls: "current-state" });
+    currentEl.style.cssText = "margin-bottom: 15px; padding: 10px; background: var(--background-primary-alt); border-radius: 5px;";
+    currentEl.createEl("h4", { text: "Current Knowledge:" });
+    const invariablesEl = currentEl.createEl("div");
+    invariablesEl.createEl("strong", { text: "Invariables: " });
+    invariablesEl.createEl("span", {
+      text: checkpointData.currentInvariables.length > 0 ? checkpointData.currentInvariables.join(", ") : "(none)"
+    });
+    const variablesEl = currentEl.createEl("div");
+    variablesEl.createEl("strong", { text: "Variables: " });
+    variablesEl.createEl("span", {
+      text: checkpointData.currentVariables.length > 0 ? checkpointData.currentVariables.length + " IF/THEN branches" : "(none)"
+    });
+    const loadingEl = contentEl.createEl("div", { text: "Loading video catalog..." });
+    loadingEl.style.cssText = "padding: 20px; text-align: center;";
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.plugin.settings.serverUrl}/api/obsidian/catalog`,
+        method: "GET",
+        headers: { "Authorization": `Bearer ${this.plugin.settings.apiToken}` }
+      });
+      this.catalogData = response.json;
+      loadingEl.remove();
+      contentEl.createEl("p", {
+        text: `Select videos to analyze for enrichment (${this.catalogData.total_videos} available):`,
+        cls: "enrich-instructions"
+      });
+      const selectedCountEl = contentEl.createEl("div", { cls: "selected-count" });
+      selectedCountEl.style.cssText = "margin-bottom: 10px; font-weight: bold; color: var(--text-accent);";
+      selectedCountEl.textContent = "0 videos selected";
+      const updateCount = () => {
+        selectedCountEl.textContent = `${this.selectedVideos.size} videos selected`;
+      };
+      const searchEl = contentEl.createEl("input", { type: "text", placeholder: "Filter instructors/series..." });
+      searchEl.style.cssText = "width: 100%; padding: 8px; margin-bottom: 10px; border-radius: 5px; border: 1px solid var(--background-modifier-border);";
+      const listEl = contentEl.createEl("div", { cls: "catalog-list" });
+      listEl.style.cssText = "max-height: 250px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: 5px; padding: 10px;";
+      const renderCatalog = (filter = "") => {
+        listEl.empty();
+        const filterLower = filter.toLowerCase();
+        for (const instructor of this.catalogData.instructors) {
+          const instructorMatches = instructor.name.toLowerCase().includes(filterLower);
+          const matchingSeries = instructor.series.filter(
+            (s) => instructorMatches || s.name.toLowerCase().includes(filterLower)
+          );
+          if (matchingSeries.length === 0 && !instructorMatches)
+            continue;
+          const groupEl = listEl.createEl("div", { cls: "instructor-group" });
+          groupEl.style.cssText = "margin-bottom: 8px;";
+          const headerEl = groupEl.createEl("div", { cls: "instructor-header" });
+          headerEl.style.cssText = "display: flex; align-items: center; gap: 5px; cursor: pointer; padding: 3px; background: var(--background-secondary); border-radius: 3px;";
+          const expandIcon = headerEl.createEl("span", { text: "\u25B6" });
+          expandIcon.style.cssText = "font-size: 0.7em;";
+          const instructorCb = headerEl.createEl("input", { type: "checkbox" });
+          headerEl.createEl("span", { text: `${instructor.name} (${instructor.video_count})` });
+          const seriesContainer = groupEl.createEl("div");
+          seriesContainer.style.cssText = "display: none; margin-left: 15px; font-size: 0.9em;";
+          headerEl.addEventListener("click", (e) => {
+            if (e.target === instructorCb)
+              return;
+            const isExpanded = seriesContainer.style.display !== "none";
+            seriesContainer.style.display = isExpanded ? "none" : "block";
+            expandIcon.style.transform = isExpanded ? "" : "rotate(90deg)";
+          });
+          const allVideoIds = [];
+          const seriesToRender = instructorMatches ? instructor.series : matchingSeries;
+          for (const series of seriesToRender) {
+            const seriesEl = seriesContainer.createEl("div");
+            seriesEl.style.cssText = "display: flex; align-items: center; gap: 5px; padding: 2px 0;";
+            const seriesCb = seriesEl.createEl("input", { type: "checkbox" });
+            seriesEl.createEl("span", { text: `${series.name} (${series.video_count})` });
+            const videoIds = series.videos.map((v) => v.video_id);
+            allVideoIds.push(...videoIds);
+            const allSelected = videoIds.every((id) => this.selectedVideos.has(id));
+            seriesCb.checked = allSelected;
+            seriesCb.addEventListener("change", () => {
+              for (const id of videoIds) {
+                if (seriesCb.checked) {
+                  this.selectedVideos.add(id);
+                } else {
+                  this.selectedVideos.delete(id);
+                }
+              }
+              updateCount();
+            });
+          }
+          instructorCb.addEventListener("change", () => {
+            const checkboxes = seriesContainer.querySelectorAll('input[type="checkbox"]');
+            checkboxes.forEach((cb) => cb.checked = instructorCb.checked);
+            for (const id of allVideoIds) {
+              if (instructorCb.checked) {
+                this.selectedVideos.add(id);
+              } else {
+                this.selectedVideos.delete(id);
+              }
+            }
+            updateCount();
+          });
+        }
+      };
+      renderCatalog();
+      searchEl.addEventListener("input", () => renderCatalog(searchEl.value));
+      const footerEl = contentEl.createEl("div", { cls: "modal-footer" });
+      footerEl.style.cssText = "margin-top: 15px; display: flex; gap: 10px; justify-content: flex-end;";
+      new import_obsidian.Setting(footerEl).addButton((btn) => btn.setButtonText("Run Enrichment").setCta().onClick(async () => {
+        if (this.selectedVideos.size === 0) {
+          new import_obsidian.Notice("Select at least one video");
+          return;
+        }
+        btn.setButtonText("Analyzing...");
+        btn.setDisabled(true);
+        try {
+          const response2 = await (0, import_obsidian.requestUrl)({
+            url: `${this.plugin.settings.serverUrl}/api/obsidian/enrich-checkpoint`,
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${this.plugin.settings.apiToken}`
+            },
+            body: JSON.stringify({
+              checkpoint_name: checkpointData.name,
+              checkpoint_cluster: checkpointData.cluster,
+              current_invariables: checkpointData.currentInvariables,
+              current_variables: checkpointData.currentVariables,
+              goal: checkpointData.goal,
+              success_test: checkpointData.successTest,
+              video_ids: Array.from(this.selectedVideos)
+            })
+          });
+          const enrichments = response2.json;
+          if (enrichments.error) {
+            new import_obsidian.Notice(`Error: ${enrichments.error}`);
+            btn.setButtonText("Run Enrichment");
+            btn.setDisabled(false);
+            return;
+          }
+          this.close();
+          const resultsModal = new EnrichmentResultsModal(
+            this.app,
+            this.plugin,
+            enrichments,
+            this.sourceFile,
+            checkpointData
+          );
+          resultsModal.open();
+        } catch (error) {
+          new import_obsidian.Notice(`Failed: ${error.message}`);
+          btn.setButtonText("Run Enrichment");
+          btn.setDisabled(false);
+        }
+      })).addButton((btn) => btn.setButtonText("Cancel").onClick(() => this.close()));
+    } catch (error) {
+      loadingEl.textContent = `Failed to load catalog: ${error.message}`;
+    }
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var EnrichmentResultsModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, enrichments, sourceFile, checkpointData) {
+    super(app);
+    this.acceptedInvariables = /* @__PURE__ */ new Set();
+    this.acceptedVariables = /* @__PURE__ */ new Set();
+    this.plugin = plugin;
+    this.enrichments = enrichments;
+    this.sourceFile = sourceFile;
+    this.checkpointData = checkpointData;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    const { enrichments } = this;
+    contentEl.createEl("h2", { text: "Enrichment Results" });
+    const statsEl = contentEl.createEl("div", { cls: "enrichment-stats" });
+    statsEl.style.cssText = "margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px;";
+    statsEl.createEl("p", { text: `Checkpoint: ${enrichments.checkpoint_name}` });
+    statsEl.createEl("p", { text: `\u{1F4F9} ${enrichments.sources_analyzed} videos analyzed` });
+    const scrollEl = contentEl.createEl("div", { cls: "enrichment-scroll" });
+    scrollEl.style.cssText = "max-height: 400px; overflow-y: auto;";
+    if (enrichments.new_invariables && enrichments.new_invariables.length > 0) {
+      const invSection = scrollEl.createEl("div", { cls: "invariables-section" });
+      invSection.createEl("h3", { text: `New Invariables (${enrichments.new_invariables.length})` });
+      enrichments.new_invariables.forEach((inv, idx) => {
+        const itemEl = invSection.createEl("div", { cls: "enrichment-item" });
+        itemEl.style.cssText = "padding: 10px; margin: 5px 0; border-radius: 5px; background: var(--background-primary-alt); border-left: 3px solid var(--text-success);";
+        const headerRow = itemEl.createEl("div");
+        headerRow.style.cssText = "display: flex; align-items: center; gap: 10px;";
+        const checkbox = headerRow.createEl("input", { type: "checkbox" });
+        checkbox.checked = true;
+        this.acceptedInvariables.add(idx);
+        checkbox.addEventListener("change", () => {
+          if (checkbox.checked) {
+            this.acceptedInvariables.add(idx);
+          } else {
+            this.acceptedInvariables.delete(idx);
+          }
+        });
+        const tierBadge = headerRow.createEl("span", { cls: "tier-badge" });
+        tierBadge.style.cssText = `padding: 2px 6px; border-radius: 3px; font-size: 0.8em; background: ${inv.tier === "CRITICAL" ? "var(--text-error)" : inv.tier === "IMPORTANT" ? "var(--text-warning)" : "var(--text-muted)"}; color: white;`;
+        tierBadge.textContent = inv.tier;
+        headerRow.createEl("strong", { text: inv.name });
+        if (inv.source_instructor) {
+          const sourceEl = itemEl.createEl("p");
+          sourceEl.style.cssText = "margin: 5px 0; font-size: 0.85em; color: var(--text-accent);";
+          sourceEl.textContent = `Source: ${inv.source_instructor}${inv.timestamp ? ` [${inv.timestamp}]` : ""}`;
+        }
+        if (inv.description) {
+          const descEl = itemEl.createEl("p");
+          descEl.style.cssText = "margin: 5px 0; font-size: 0.9em; color: var(--text-muted);";
+          descEl.textContent = inv.description;
+        }
+      });
+    }
+    if (enrichments.new_variables && enrichments.new_variables.length > 0) {
+      const varSection = scrollEl.createEl("div", { cls: "variables-section" });
+      varSection.style.cssText = "margin-top: 15px;";
+      varSection.createEl("h3", { text: `\u{1F500} New Variables (${enrichments.new_variables.length})` });
+      enrichments.new_variables.forEach((v, idx) => {
+        const itemEl = varSection.createEl("div", { cls: "enrichment-item" });
+        itemEl.style.cssText = "padding: 10px; margin: 5px 0; border-radius: 5px; background: var(--background-primary-alt); border-left: 3px solid var(--text-warning);";
+        const headerRow = itemEl.createEl("div");
+        headerRow.style.cssText = "display: flex; align-items: center; gap: 10px;";
+        const checkbox = headerRow.createEl("input", { type: "checkbox" });
+        checkbox.checked = true;
+        this.acceptedVariables.add(idx);
+        checkbox.addEventListener("change", () => {
+          if (checkbox.checked) {
+            this.acceptedVariables.add(idx);
+          } else {
+            this.acceptedVariables.delete(idx);
+          }
+        });
+        headerRow.createEl("strong", { text: `${v.condition} \u2192 ${v.action}` });
+        if (v.source_instructor) {
+          const sourceEl = itemEl.createEl("p");
+          sourceEl.style.cssText = "margin: 5px 0; font-size: 0.85em; color: var(--text-accent);";
+          sourceEl.textContent = `Source: ${v.source_instructor}${v.timestamp ? ` [${v.timestamp}]` : ""}`;
+        }
+        if (v.description) {
+          const descEl = itemEl.createEl("p");
+          descEl.style.cssText = "margin: 5px 0; font-size: 0.9em; color: var(--text-muted);";
+          descEl.textContent = v.description;
+        }
+      });
+    }
+    if (enrichments.defensive_inversions && enrichments.defensive_inversions.length > 0) {
+      const invSection = scrollEl.createEl("div", { cls: "inversions-section" });
+      invSection.style.cssText = "margin-top: 15px;";
+      invSection.createEl("h3", { text: `Defensive Inversions (${enrichments.defensive_inversions.length})` });
+      for (const inv of enrichments.defensive_inversions) {
+        const itemEl = invSection.createEl("div", { cls: "inversion-item" });
+        itemEl.style.cssText = "padding: 10px; margin: 5px 0; border-radius: 5px; background: var(--background-primary-alt); border-left: 3px solid var(--interactive-accent);";
+        itemEl.createEl("p", { text: `Defender wants: ${inv.defensive_concept}` });
+        itemEl.createEl("p", { text: `\u2192 You should: ${inv.offensive_counter}` });
+        if (inv.source_instructor) {
+          const srcEl = itemEl.createEl("p");
+          srcEl.style.cssText = "font-size: 0.85em; color: var(--text-accent);";
+          srcEl.textContent = `Source: ${inv.source_instructor}`;
+        }
+      }
+    }
+    if (enrichments.key_insights && enrichments.key_insights.length > 0) {
+      const insightsSection = scrollEl.createEl("div", { cls: "insights-section" });
+      insightsSection.style.cssText = "margin-top: 15px;";
+      insightsSection.createEl("h3", { text: `Key Insights` });
+      const ul = insightsSection.createEl("ul");
+      for (const insight of enrichments.key_insights) {
+        ul.createEl("li", { text: insight });
+      }
+    }
+    const footerEl = contentEl.createEl("div", { cls: "modal-footer" });
+    footerEl.style.cssText = "margin-top: 15px; display: flex; gap: 10px; justify-content: flex-end;";
+    new import_obsidian.Setting(footerEl).addButton((btn) => btn.setButtonText("Apply Selected Enrichments").setCta().onClick(async () => {
+      await this.applyEnrichments();
+    })).addButton((btn) => btn.setButtonText("Cancel").onClick(() => this.close()));
+  }
+  async applyEnrichments() {
+    var _a, _b, _c, _d, _e;
+    const { enrichments, sourceFile, checkpointData } = this;
+    try {
+      let content = await this.app.vault.read(sourceFile);
+      const newInvariables = ((_a = enrichments.new_invariables) == null ? void 0 : _a.filter(
+        (_, idx) => this.acceptedInvariables.has(idx)
+      )) || [];
+      const newVariables = ((_b = enrichments.new_variables) == null ? void 0 : _b.filter(
+        (_, idx) => this.acceptedVariables.has(idx)
+      )) || [];
+      if (newInvariables.length === 0 && newVariables.length === 0) {
+        new import_obsidian.Notice("No enrichments selected");
+        return;
+      }
+      const createdFiles = [];
+      if (newInvariables.length > 0) {
+        const tableMatch = content.match(/(## INVARIABLES[\s\S]*?\| REFINEMENT \|[^\n]*)/);
+        if (tableMatch) {
+          let newRows = "";
+          for (const inv of newInvariables) {
+            const safeName = inv.name.replace(/[\\/:*?"<>|]/g, "-").substring(0, 60);
+            const conceptPath = `${(_c = sourceFile.parent) == null ? void 0 : _c.path}/${safeName}.md`;
+            const conceptContent = `---
+type: method
+method_type: invariable
+cluster: "${checkpointData.cluster}"
+tier: "${inv.tier}"
+source_instructor: "${inv.source_instructor || "Unknown"}"
+video_id: "${inv.video_id || ""}"
+timestamp: "${inv.timestamp || ""}"
+clip_duration: 30
+enrichment_source: true
+---
+
+# ${inv.name}
+
+${inv.description || ""}
+
+## Clip Info
+- **Instructor:** ${inv.source_instructor || "Unknown"}
+- **Timestamp:** ${inv.timestamp || "N/A"}
+- **Video ID:** ${inv.video_id || "N/A"}
+`;
+            const existingFile = this.app.vault.getAbstractFileByPath(conceptPath);
+            if (!existingFile) {
+              const newFile = await this.app.vault.create(conceptPath, conceptContent);
+              createdFiles.push(newFile);
+            }
+            const linkText = `[[${safeName}]]`;
+            newRows += `| ${inv.tier} | ${linkText} |
+`;
+          }
+          const refinementMatch = content.match(/(\| REFINEMENT \|[^\n]*\n)/);
+          if (refinementMatch) {
+            content = content.replace(refinementMatch[1], newRows + refinementMatch[1]);
+          }
+        }
+      }
+      if (newVariables.length > 0) {
+        const variablesMatch = content.match(/(## VARIABLES \(IF\/THEN\)\n\n)([\s\S]*?)(\n---)/);
+        if (variablesMatch) {
+          let newVarText = "";
+          for (const v of newVariables) {
+            const safeName = v.condition.replace(/^IF\s*/i, "").replace(/[\\/:*?"<>|]/g, "-").substring(0, 50);
+            const varPath = `${(_d = sourceFile.parent) == null ? void 0 : _d.path}/VAR - ${safeName}.md`;
+            const varContent = `---
+type: method
+method_type: variable
+cluster: "${checkpointData.cluster}"
+condition: "${v.condition}"
+action: "${v.action}"
+source_instructor: "${v.source_instructor || "Unknown"}"
+video_id: "${v.video_id || ""}"
+timestamp: "${v.timestamp || ""}"
+clip_duration: 30
+enrichment_source: true
+---
+
+# ${v.condition}
+
+**Action:** ${v.action}
+
+${v.description || ""}
+
+## Clip Info
+- **Instructor:** ${v.source_instructor || "Unknown"}
+- **Timestamp:** ${v.timestamp || "N/A"}
+- **Video ID:** ${v.video_id || "N/A"}
+`;
+            const existingVarFile = this.app.vault.getAbstractFileByPath(varPath);
+            if (!existingVarFile) {
+              const newVarFile = await this.app.vault.create(varPath, varContent);
+              createdFiles.push(newVarFile);
+            }
+            newVarText += `- **${v.condition}** \u2192 ${v.action} \u2192 [[VAR - ${safeName}]]
+`;
+          }
+          content = content.replace(
+            variablesMatch[0],
+            variablesMatch[1] + variablesMatch[2] + newVarText + variablesMatch[3]
+          );
+        }
+      }
+      const enrichmentDate = new Date().toISOString().split("T")[0];
+      if (content.includes("---\n")) {
+        const parts = content.split("---");
+        if (parts.length >= 2) {
+          parts[1] = parts[1].replace(/\nlast_enriched:.*$/gm, "").replace(/\nenrichment_sources:.*$/gm, "").trimEnd();
+          parts[1] += `
+last_enriched: ${enrichmentDate}
+enrichment_sources: ${enrichments.sources_analyzed} videos
+`;
+          content = parts.join("---");
+        }
+      }
+      await this.app.vault.modify(sourceFile, content);
+      const canvasLeaves = this.app.workspace.getLeavesOfType("canvas");
+      if (canvasLeaves.length > 0 && createdFiles.length > 0) {
+        const canvasView = canvasLeaves[0].view;
+        const canvas = canvasView == null ? void 0 : canvasView.canvas;
+        if (canvas) {
+          let checkpointNode = null;
+          let checkpointX = 0;
+          let checkpointY = 0;
+          for (const node of canvas.nodes.values()) {
+            if (((_e = node.file) == null ? void 0 : _e.path) === sourceFile.path) {
+              checkpointNode = node;
+              checkpointX = node.x;
+              checkpointY = node.y;
+              break;
+            }
+          }
+          const nodeWidth = 250;
+          const nodeHeight = 100;
+          const spacing = 50;
+          const startX = checkpointX + 350;
+          let currentY = checkpointY - (createdFiles.length - 1) * (nodeHeight + spacing) / 2;
+          for (const file of createdFiles) {
+            const nodeData = {
+              id: `enrichment-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+              type: "file",
+              file: file.path,
+              x: startX,
+              y: currentY,
+              width: nodeWidth,
+              height: nodeHeight
+            };
+            canvas.createFileNode({
+              file,
+              pos: { x: startX, y: currentY },
+              size: { width: nodeWidth, height: nodeHeight }
+            });
+            currentY += nodeHeight + spacing;
+          }
+          canvas.requestSave();
+          new import_obsidian.Notice(`Added ${createdFiles.length} nodes to Canvas`);
+        }
+      }
+      new import_obsidian.Notice(`Applied ${newInvariables.length} invariables and ${newVariables.length} variables`);
+      this.close();
+      const leaf = this.app.workspace.getLeaf();
+      await leaf.openFile(sourceFile);
+    } catch (error) {
+      new import_obsidian.Notice(`Failed to apply enrichments: ${error.message}`);
+      console.error("Apply enrichments error:", error);
+    }
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var RLMPipelineModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, canvasFile, folder, checkpointFiles) {
+    super(app);
+    this.selectedVideos = /* @__PURE__ */ new Set();
+    this.catalogData = null;
+    this.plugin = plugin;
+    this.canvasFile = canvasFile;
+    this.folder = folder;
+    this.checkpointFiles = checkpointFiles;
+  }
+  async onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: "RLM Pipeline: Enrich & Rebuild" });
+    const stepsEl = contentEl.createEl("div", { cls: "pipeline-steps" });
+    stepsEl.style.cssText = "margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px;";
+    stepsEl.createEl("p", { text: "This will:", cls: "steps-header" });
+    const stepsList = stepsEl.createEl("ol");
+    stepsList.style.cssText = "margin: 5px 0; padding-left: 25px; font-size: 0.9em;";
+    stepsList.createEl("li", { text: "Backup current canvas (version control)" });
+    stepsList.createEl("li", { text: "Enrich all checkpoints with selected videos" });
+    stepsList.createEl("li", { text: "Rebuild canvas with proper layout & connections" });
+    const infoEl = contentEl.createEl("div", { cls: "checkpoint-info" });
+    infoEl.style.cssText = "margin-bottom: 15px; padding: 10px; background: var(--background-primary-alt); border-radius: 5px;";
+    infoEl.createEl("p", { text: `Found ${this.checkpointFiles.length} checkpoints in ${this.folder.name}:` });
+    const checkpointList = infoEl.createEl("ul");
+    checkpointList.style.cssText = "margin: 5px 0; padding-left: 20px; font-size: 0.9em; max-height: 100px; overflow-y: auto;";
+    for (const file of this.checkpointFiles) {
+      checkpointList.createEl("li", { text: file.basename });
+    }
+    const loadingEl = contentEl.createEl("div", { text: "Loading video catalog..." });
+    loadingEl.style.cssText = "padding: 20px; text-align: center;";
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.plugin.settings.serverUrl}/api/obsidian/catalog`,
+        method: "GET",
+        headers: { "Authorization": `Bearer ${this.plugin.settings.apiToken}` }
+      });
+      this.catalogData = response.json;
+      loadingEl.remove();
+      contentEl.createEl("p", {
+        text: `Select videos to cross-reference ALL checkpoints (${this.catalogData.total_videos} available):`
+      });
+      const selectedCountEl = contentEl.createEl("div", { cls: "selected-count" });
+      selectedCountEl.style.cssText = "margin-bottom: 10px; font-weight: bold; color: var(--text-accent);";
+      selectedCountEl.textContent = "0 videos selected";
+      const updateCount = () => {
+        selectedCountEl.textContent = `${this.selectedVideos.size} videos selected`;
+      };
+      const searchEl = contentEl.createEl("input", { type: "text", placeholder: "Filter instructors/series..." });
+      searchEl.style.cssText = "width: 100%; padding: 8px; margin-bottom: 10px; border-radius: 5px; border: 1px solid var(--background-modifier-border);";
+      const listEl = contentEl.createEl("div", { cls: "catalog-list" });
+      listEl.style.cssText = "max-height: 200px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: 5px; padding: 10px;";
+      const renderCatalog = (filter = "") => {
+        listEl.empty();
+        const filterLower = filter.toLowerCase();
+        for (const instructor of this.catalogData.instructors) {
+          const instructorMatches = instructor.name.toLowerCase().includes(filterLower);
+          const matchingSeries = instructor.series.filter(
+            (s) => instructorMatches || s.name.toLowerCase().includes(filterLower)
+          );
+          if (matchingSeries.length === 0 && !instructorMatches)
+            continue;
+          const groupEl = listEl.createEl("div", { cls: "instructor-group" });
+          groupEl.style.cssText = "margin-bottom: 8px;";
+          const headerEl = groupEl.createEl("div", { cls: "instructor-header" });
+          headerEl.style.cssText = "display: flex; align-items: center; gap: 5px; cursor: pointer; padding: 3px; background: var(--background-secondary); border-radius: 3px;";
+          const expandIcon = headerEl.createEl("span", { text: ">" });
+          expandIcon.style.cssText = "font-size: 0.8em; width: 12px;";
+          const instructorCb = headerEl.createEl("input", { type: "checkbox" });
+          headerEl.createEl("span", { text: `${instructor.name} (${instructor.video_count})` });
+          const seriesContainer = groupEl.createEl("div");
+          seriesContainer.style.cssText = "display: none; margin-left: 20px; font-size: 0.9em;";
+          headerEl.addEventListener("click", (e) => {
+            if (e.target === instructorCb)
+              return;
+            const isExpanded = seriesContainer.style.display !== "none";
+            seriesContainer.style.display = isExpanded ? "none" : "block";
+            expandIcon.textContent = isExpanded ? ">" : "v";
+          });
+          const allVideoIds = [];
+          const seriesToRender = instructorMatches ? instructor.series : matchingSeries;
+          for (const series of seriesToRender) {
+            const seriesEl = seriesContainer.createEl("div");
+            seriesEl.style.cssText = "display: flex; align-items: center; gap: 5px; padding: 2px 0;";
+            const seriesCb = seriesEl.createEl("input", { type: "checkbox" });
+            seriesEl.createEl("span", { text: `${series.name} (${series.video_count})` });
+            const videoIds = series.videos.map((v) => v.video_id);
+            allVideoIds.push(...videoIds);
+            const allSelected = videoIds.every((id) => this.selectedVideos.has(id));
+            seriesCb.checked = allSelected;
+            seriesCb.addEventListener("change", () => {
+              for (const id of videoIds) {
+                if (seriesCb.checked) {
+                  this.selectedVideos.add(id);
+                } else {
+                  this.selectedVideos.delete(id);
+                }
+              }
+              updateCount();
+            });
+          }
+          instructorCb.addEventListener("change", () => {
+            const checkboxes = seriesContainer.querySelectorAll('input[type="checkbox"]');
+            checkboxes.forEach((cb) => cb.checked = instructorCb.checked);
+            for (const id of allVideoIds) {
+              if (instructorCb.checked) {
+                this.selectedVideos.add(id);
+              } else {
+                this.selectedVideos.delete(id);
+              }
+            }
+            updateCount();
+          });
+        }
+      };
+      renderCatalog();
+      searchEl.addEventListener("input", () => renderCatalog(searchEl.value));
+      const progressEl = contentEl.createEl("div", { cls: "progress-area" });
+      progressEl.style.cssText = "display: none; margin-top: 15px; padding: 10px; background: var(--background-primary-alt); border-radius: 5px;";
+      const footerEl = contentEl.createEl("div", { cls: "modal-footer" });
+      footerEl.style.cssText = "margin-top: 15px; display: flex; gap: 10px; justify-content: flex-end;";
+      new import_obsidian.Setting(footerEl).addButton((btn) => btn.setButtonText("Run RLM Pipeline").setCta().onClick(async () => {
+        var _a, _b, _c;
+        if (this.selectedVideos.size === 0) {
+          new import_obsidian.Notice("Select at least one video");
+          return;
+        }
+        btn.setButtonText("Running Pipeline...");
+        btn.setDisabled(true);
+        progressEl.style.display = "block";
+        progressEl.empty();
+        progressEl.createEl("h4", { text: "Step 1: Backing up canvas..." });
+        const backupName = `${this.canvasFile.basename}_backup_${Date.now()}.canvas`;
+        const backupPath = `${this.folder.path}/${backupName}`;
+        try {
+          const canvasContent = await this.app.vault.read(this.canvasFile);
+          await this.app.vault.create(backupPath, canvasContent);
+          progressEl.createEl("p", { text: `Backup saved: ${backupName}` });
+        } catch (e) {
+          progressEl.createEl("p", { text: "Backup failed, continuing..." });
+        }
+        progressEl.createEl("h4", { text: "Step 2: Enriching checkpoints..." });
+        const videoIds = Array.from(this.selectedVideos);
+        let successCount = 0;
+        let totalNewConcepts = 0;
+        for (let i = 0; i < this.checkpointFiles.length; i++) {
+          const file = this.checkpointFiles[i];
+          const checkpointName = file.basename;
+          const statusEl = progressEl.createEl("div");
+          statusEl.textContent = `[${i + 1}/${this.checkpointFiles.length}] ${checkpointName}...`;
+          try {
+            const content = await this.app.vault.read(file);
+            const cache = this.app.metadataCache.getFileCache(file);
+            const invariablesMatch = content.match(/## INVARIABLES[\s\S]*?\|[\s\S]*?\|([\s\S]*?)(?=\n---|\n##|$)/);
+            const currentInvariables = [];
+            if (invariablesMatch) {
+              const links = invariablesMatch[1].match(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g) || [];
+              for (const link of links) {
+                const nameMatch = link.match(/\[\[(?:[^\]|]+\|)?([^\]]+)\]\]/);
+                if (nameMatch && nameMatch[1] !== "none") {
+                  currentInvariables.push(nameMatch[1].trim());
+                }
+              }
+            }
+            const variablesMatch = content.match(/## VARIABLES[\s\S]*?((?:- \*\*IF.*\n?)+)/);
+            const currentVariables = [];
+            if (variablesMatch) {
+              const lines = variablesMatch[1].match(/- \*\*IF[^*]+\*\*[^\n]+/g) || [];
+              currentVariables.push(...lines.map((l) => l.replace(/^- /, "").trim()));
+            }
+            const goalMatch = content.match(/## Goal\n\n([^\n]+)/);
+            const goal = goalMatch ? goalMatch[1].trim() : "";
+            const successMatch = content.match(/## Success Test\n\n> ([^\n]+)/);
+            const successTest = successMatch ? successMatch[1].trim() : "";
+            const response2 = await (0, import_obsidian.requestUrl)({
+              url: `${this.plugin.settings.serverUrl}/api/obsidian/enrich-checkpoint`,
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${this.plugin.settings.apiToken}`
+              },
+              body: JSON.stringify({
+                checkpoint_name: checkpointName,
+                checkpoint_cluster: ((_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.cluster) || "",
+                current_invariables: currentInvariables,
+                current_variables: currentVariables,
+                goal,
+                success_test: successTest,
+                video_ids: videoIds
+              }),
+              throw: false
+            });
+            if (response2.status === 200) {
+              const enrichments = response2.json;
+              const newCount = (((_b = enrichments.new_invariables) == null ? void 0 : _b.length) || 0) + (((_c = enrichments.new_variables) == null ? void 0 : _c.length) || 0);
+              totalNewConcepts += newCount;
+              if (newCount > 0) {
+                await this.applyEnrichmentsToCheckpoint(file, enrichments);
+              }
+              statusEl.textContent = `[${i + 1}/${this.checkpointFiles.length}] ${checkpointName} - ${newCount} new concepts`;
+              statusEl.style.color = "var(--text-success)";
+              successCount++;
+            } else {
+              statusEl.textContent = `[${i + 1}/${this.checkpointFiles.length}] ${checkpointName} - Failed`;
+              statusEl.style.color = "var(--text-error)";
+            }
+          } catch (error) {
+            statusEl.textContent = `[${i + 1}/${this.checkpointFiles.length}] ${checkpointName} - Error: ${error.message}`;
+            statusEl.style.color = "var(--text-error)";
+          }
+        }
+        progressEl.createEl("hr");
+        progressEl.createEl("h4", { text: "Step 3: Rebuilding canvas..." });
+        const rebuildStatus = progressEl.createEl("div");
+        rebuildStatus.textContent = "Scanning checkpoint files and linked concepts...";
+        try {
+          const newCanvasPath = await this.rebuildCanvasForFolder(this.folder, this.canvasFile.basename);
+          rebuildStatus.textContent = `Canvas rebuilt: ${newCanvasPath}`;
+          rebuildStatus.style.color = "var(--text-success)";
+        } catch (err) {
+          rebuildStatus.textContent = `Canvas rebuild failed: ${err.message}`;
+          rebuildStatus.style.color = "var(--text-error)";
+        }
+        progressEl.createEl("hr");
+        progressEl.createEl("p", {
+          text: `Complete: ${successCount}/${this.checkpointFiles.length} checkpoints enriched, ${totalNewConcepts} new concepts added`
+        });
+        btn.setButtonText("Done");
+        btn.setDisabled(false);
+        btn.buttonEl.onclick = () => this.close();
+        new import_obsidian.Notice(`RLM Pipeline complete: ${totalNewConcepts} new concepts, canvas rebuilt`);
+      })).addButton((btn) => btn.setButtonText("Cancel").onClick(() => this.close()));
+    } catch (error) {
+      loadingEl.textContent = `Error loading catalog: ${error.message}`;
+    }
+  }
+  async applyEnrichmentsToCheckpoint(file, enrichments) {
+    var _a, _b, _c, _d, _e;
+    const cache = this.app.metadataCache.getFileCache(file);
+    const cluster = ((_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.cluster) || "";
+    let content = await this.app.vault.read(file);
+    if (((_b = enrichments.new_invariables) == null ? void 0 : _b.length) > 0) {
+      const tableMatch = content.match(/(## INVARIABLES[\s\S]*?\| REFINEMENT \|[^\n]*)/);
+      if (tableMatch) {
+        let newRows = "";
+        for (const inv of enrichments.new_invariables) {
+          const safeName = inv.name.replace(/[\\/:*?"<>|]/g, "-").substring(0, 60);
+          const conceptPath = `${(_c = file.parent) == null ? void 0 : _c.path}/${safeName}.md`;
+          const conceptContent = `---
+type: method
+method_type: invariable
+cluster: "${cluster}"
+tier: "${inv.tier}"
+source_instructor: "${inv.source_instructor || "Unknown"}"
+video_id: "${inv.video_id || ""}"
+timestamp: "${inv.timestamp || ""}"
+clip_duration: 30
+enrichment_source: true
+---
+
+# ${inv.name}
+
+${inv.description || ""}
+
+## Clip Info
+- **Instructor:** ${inv.source_instructor || "Unknown"}
+- **Timestamp:** ${inv.timestamp || "N/A"}
+- **Video ID:** ${inv.video_id || "N/A"}
+`;
+          const existingFile = this.app.vault.getAbstractFileByPath(conceptPath);
+          if (!existingFile) {
+            await this.app.vault.create(conceptPath, conceptContent);
+          }
+          const linkText = `[[${safeName}]]`;
+          newRows += `| ${inv.tier} | ${linkText} |
+`;
+        }
+        const refinementMatch = content.match(/(\| REFINEMENT \|[^\n]*\n)/);
+        if (refinementMatch) {
+          content = content.replace(refinementMatch[1], newRows + refinementMatch[1]);
+        }
+      }
+    }
+    if (((_d = enrichments.new_variables) == null ? void 0 : _d.length) > 0) {
+      const variablesMatch = content.match(/(## VARIABLES \(IF\/THEN\)\n\n)([\s\S]*?)(\n---)/);
+      if (variablesMatch) {
+        let newVarText = "";
+        for (const v of enrichments.new_variables) {
+          const safeName = v.condition.replace(/^IF\s*/i, "").replace(/[\\/:*?"<>|]/g, "-").substring(0, 50);
+          const varPath = `${(_e = file.parent) == null ? void 0 : _e.path}/VAR - ${safeName}.md`;
+          const varContent = `---
+type: method
+method_type: variable
+cluster: "${cluster}"
+condition: "${v.condition}"
+action: "${v.action}"
+source_instructor: "${v.source_instructor || "Unknown"}"
+video_id: "${v.video_id || ""}"
+timestamp: "${v.timestamp || ""}"
+clip_duration: 30
+enrichment_source: true
+---
+
+# ${v.condition}
+
+**Action:** ${v.action}
+
+${v.description || ""}
+
+## Clip Info
+- **Instructor:** ${v.source_instructor || "Unknown"}
+- **Timestamp:** ${v.timestamp || "N/A"}
+- **Video ID:** ${v.video_id || "N/A"}
+`;
+          const existingVarFile = this.app.vault.getAbstractFileByPath(varPath);
+          if (!existingVarFile) {
+            await this.app.vault.create(varPath, varContent);
+          }
+          newVarText += `- **${v.condition}** \u2192 ${v.action} \u2192 [[VAR - ${safeName}]]
+`;
+        }
+        content = content.replace(
+          variablesMatch[0],
+          variablesMatch[1] + variablesMatch[2] + newVarText + variablesMatch[3]
+        );
+      }
+    }
+    const enrichmentDate = new Date().toISOString().split("T")[0];
+    if (content.includes("---\n")) {
+      const parts = content.split("---");
+      if (parts.length >= 2) {
+        parts[1] = parts[1].replace(/\nlast_enriched:.*$/gm, "").replace(/\nenrichment_sources:.*$/gm, "").trimEnd();
+        parts[1] += `
+last_enriched: ${enrichmentDate}
+enrichment_sources: ${enrichments.sources_analyzed} videos
+`;
+        content = parts.join("---");
+      }
+    }
+    await this.app.vault.modify(file, content);
+  }
+  /**
+   * Rebuild canvas from checkpoints in a folder.
+   * Creates a new canvas with proper layout and connections.
+   */
+  async rebuildCanvasForFolder(folder, canvasBasename) {
+    var _a, _b;
+    const checkpoints = [];
+    const methods = [];
+    for (const file of this.app.vault.getFiles()) {
+      if (file.extension !== "md")
+        continue;
+      if (((_a = file.parent) == null ? void 0 : _a.path) !== folder.path)
+        continue;
+      const cache = this.app.metadataCache.getFileCache(file);
+      const frontmatter = cache == null ? void 0 : cache.frontmatter;
+      if ((frontmatter == null ? void 0 : frontmatter.type) === "checkpoint") {
+        const content = await this.app.vault.read(file);
+        const order = (frontmatter == null ? void 0 : frontmatter.order) || parseInt(((_b = file.basename.match(/\[(\d+)\]/)) == null ? void 0 : _b[1]) || "99");
+        const invariables = [];
+        const invMatch = content.match(/## INVARIABLES[\s\S]*?\|([\s\S]*?)(?=\n##|\n---)/);
+        if (invMatch) {
+          const links = invMatch[1].match(/\[\[([^\]|]+)/g) || [];
+          for (const link of links) {
+            const name = link.replace("[[", "").trim();
+            if (name && name !== "none") {
+              invariables.push(name);
+            }
+          }
+        }
+        const navigation = [];
+        const navMatch = content.match(/## Navigation[\s\S]*?((?:\[\[[^\]]+\]\][^\n]*\n?)+)/);
+        if (navMatch) {
+          const navLinks = navMatch[1].match(/\[\[([^\]|]+)/g) || [];
+          for (const link of navLinks) {
+            navigation.push(link.replace("[[", "").trim());
+          }
+        }
+        checkpoints.push({
+          file,
+          order,
+          cluster: (frontmatter == null ? void 0 : frontmatter.cluster) || "",
+          invariables,
+          navigation
+        });
+      } else if ((frontmatter == null ? void 0 : frontmatter.type) === "method" || (frontmatter == null ? void 0 : frontmatter.type) === "concept" || (frontmatter == null ? void 0 : frontmatter.method_type)) {
+        methods.push({
+          file,
+          tier: (frontmatter == null ? void 0 : frontmatter.tier) || (frontmatter == null ? void 0 : frontmatter.method_type) || "REFINEMENT",
+          cluster: (frontmatter == null ? void 0 : frontmatter.cluster) || ""
+        });
+      }
+    }
+    if (checkpoints.length === 0) {
+      throw new Error("No checkpoint files found");
+    }
+    checkpoints.sort((a, b) => a.order - b.order);
+    const canvasData = { nodes: [], edges: [] };
+    const checkpointWidth = 300;
+    const checkpointHeight = 150;
+    const methodWidth = 200;
+    const methodHeight = 80;
+    const horizontalGap = 400;
+    const methodOffsetX = 350;
+    const methodGap = 100;
+    let currentX = 100;
+    const checkpointY = 300;
+    const nodeIdMap = /* @__PURE__ */ new Map();
+    for (let i = 0; i < checkpoints.length; i++) {
+      const cp = checkpoints[i];
+      const nodeId = `checkpoint-${i}`;
+      nodeIdMap.set(cp.file.basename, nodeId);
+      canvasData.nodes.push({
+        id: nodeId,
+        type: "file",
+        file: cp.file.path,
+        x: currentX,
+        y: checkpointY,
+        width: checkpointWidth,
+        height: checkpointHeight,
+        color: "4"
+      });
+      let methodY = checkpointY - methodGap - methodHeight;
+      for (const invName of cp.invariables) {
+        const methodFile = methods.find((m) => m.file.basename === invName);
+        if (methodFile) {
+          const methodId = `method-${nodeIdMap.size}`;
+          nodeIdMap.set(invName, methodId);
+          let color = "0";
+          if (methodFile.tier === "CRITICAL")
+            color = "1";
+          else if (methodFile.tier === "IMPORTANT")
+            color = "6";
+          else if (methodFile.tier === "invariable")
+            color = "5";
+          canvasData.nodes.push({
+            id: methodId,
+            type: "file",
+            file: methodFile.file.path,
+            x: currentX + methodOffsetX,
+            y: methodY,
+            width: methodWidth,
+            height: methodHeight,
+            color
+          });
+          canvasData.edges.push({
+            id: `edge-${canvasData.edges.length}`,
+            fromNode: nodeId,
+            fromSide: "right",
+            toNode: methodId,
+            toSide: "left"
+          });
+          methodY -= methodHeight + 30;
+        }
+      }
+      if (i < checkpoints.length - 1) {
+        canvasData.edges.push({
+          id: `edge-cp-${i}`,
+          fromNode: nodeId,
+          fromSide: "right",
+          toNode: `checkpoint-${i + 1}`,
+          toSide: "left",
+          color: "5"
+        });
+      }
+      currentX += horizontalGap;
+    }
+    for (const cp of checkpoints) {
+      const fromId = nodeIdMap.get(cp.file.basename);
+      for (const navTarget of cp.navigation) {
+        const toId = nodeIdMap.get(navTarget);
+        if (fromId && toId && fromId !== toId) {
+          const exists = canvasData.edges.some(
+            (e) => e.fromNode === fromId && e.toNode === toId
+          );
+          if (!exists) {
+            canvasData.edges.push({
+              id: `edge-nav-${canvasData.edges.length}`,
+              fromNode: fromId,
+              fromSide: "bottom",
+              toNode: toId,
+              toSide: "top",
+              color: "3"
+            });
+          }
+        }
+      }
+    }
+    const canvasPath = `${folder.path}/${canvasBasename} - RLM.canvas`;
+    const canvasContent = JSON.stringify(canvasData, null, 2);
+    const existingCanvas = this.app.vault.getAbstractFileByPath(canvasPath);
+    if (existingCanvas) {
+      await this.app.vault.modify(existingCanvas, canvasContent);
+    } else {
+      await this.app.vault.create(canvasPath, canvasContent);
+    }
+    const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
+    if (canvasFile) {
+      await this.app.workspace.getLeaf().openFile(canvasFile);
+    }
+    return canvasPath;
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var ClipBrowserModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, sourceFile, clipData) {
+    super(app);
+    this.plugin = plugin;
+    this.sourceFile = sourceFile;
+    this.clipData = clipData;
+  }
+  onOpen() {
+    var _a;
+    const { contentEl } = this;
+    const { clipData, sourceFile } = this;
+    contentEl.createEl("h2", { text: `Clip Options: ${sourceFile.basename}` });
+    const infoEl = contentEl.createEl("div", { cls: "clip-info" });
+    infoEl.style.cssText = "margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px;";
+    infoEl.createEl("p", { text: `Video: ${clipData.video_name || clipData.video_id}` });
+    infoEl.createEl("p", { text: `Instructor: ${clipData.instructor || "Unknown"}` });
+    infoEl.createEl("p", { text: `Found ${((_a = clipData.clips) == null ? void 0 : _a.length) || 0} relevant sections` });
+    if (!clipData.clips || clipData.clips.length === 0) {
+      contentEl.createEl("p", { text: "No clip options found for this concept." });
+      return;
+    }
+    const listEl = contentEl.createEl("div", { cls: "clip-list" });
+    listEl.style.cssText = "max-height: 400px; overflow-y: auto;";
+    for (const clip of clipData.clips) {
+      const clipEl = listEl.createEl("div", { cls: "clip-option" });
+      clipEl.style.cssText = "margin-bottom: 15px; padding: 12px; background: var(--background-primary-alt); border-radius: 5px; border-left: 3px solid var(--text-accent);";
+      const headerEl = clipEl.createEl("div", { cls: "clip-header" });
+      headerEl.style.cssText = "display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;";
+      const timestampEl = headerEl.createEl("span", { cls: "clip-timestamp" });
+      timestampEl.style.cssText = "font-weight: bold; font-size: 1.1em; color: var(--text-accent);";
+      timestampEl.textContent = clip.timestamp || "Unknown";
+      const durationEl = headerEl.createEl("span", { cls: "clip-duration" });
+      durationEl.style.cssText = "font-size: 0.9em; color: var(--text-muted);";
+      durationEl.textContent = `${clip.duration || 30}s`;
+      const summaryEl = clipEl.createEl("div", { cls: "clip-summary" });
+      summaryEl.style.cssText = "margin-bottom: 10px; font-size: 0.95em;";
+      summaryEl.textContent = clip.summary || clip.description || "No description";
+      if (clip.excerpt) {
+        const excerptEl = clipEl.createEl("div", { cls: "clip-excerpt" });
+        excerptEl.style.cssText = "font-size: 0.85em; color: var(--text-muted); font-style: italic; margin-bottom: 10px; padding: 8px; background: var(--background-secondary); border-radius: 3px;";
+        excerptEl.textContent = `"${clip.excerpt.substring(0, 200)}${clip.excerpt.length > 200 ? "..." : ""}"`;
+      }
+      const btnEl = clipEl.createEl("button", { text: "Extract This Clip" });
+      btnEl.style.cssText = "padding: 6px 12px; background: var(--interactive-accent); color: var(--text-on-accent); border: none; border-radius: 4px; cursor: pointer;";
+      btnEl.addEventListener("click", async () => {
+        var _a2, _b;
+        btnEl.textContent = "Extracting...";
+        btnEl.disabled = true;
+        const parts = (clip.timestamp || "0:00").split(":").map((p) => parseInt(p, 10));
+        let startSeconds = 0;
+        if (parts.length === 3) {
+          startSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+        } else if (parts.length === 2) {
+          startSeconds = parts[0] * 60 + parts[1];
+        }
+        const clipPath = await this.plugin.doExtractClip(
+          clipData.video_id,
+          startSeconds,
+          clip.duration || 30,
+          `${sourceFile.basename}_${((_a2 = clip.timestamp) == null ? void 0 : _a2.replace(/:/g, "-")) || "clip"}`
+        );
+        if (clipPath) {
+          new import_obsidian.Notice(`Clip saved: ${clipPath}`);
+          btnEl.textContent = "Extracted!";
+          btnEl.style.background = "var(--text-success)";
+          let content = await this.app.vault.read(sourceFile);
+          if (!content.includes("## Extracted Clips")) {
+            content += `
+
+## Extracted Clips
+`;
+          }
+          content += `- [${clip.timestamp}] ${((_b = clip.summary) == null ? void 0 : _b.substring(0, 50)) || "Clip"} - \`${clipPath}\`
+`;
+          await this.app.vault.modify(sourceFile, content);
+        } else {
+          new import_obsidian.Notice("Failed to extract clip");
+          btnEl.textContent = "Failed - Try Again";
+          btnEl.disabled = false;
+        }
+      });
+    }
+    const footerEl = contentEl.createEl("div", { cls: "modal-footer" });
+    footerEl.style.cssText = "margin-top: 15px; text-align: right;";
+    new import_obsidian.Setting(footerEl).addButton((btn) => btn.setButtonText("Close").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var LinkedSourcesModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, sourcesData, sourceFile) {
+    super(app);
+    this.plugin = plugin;
+    this.sourcesData = sourcesData;
+    this.sourceFile = sourceFile;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    const { sourcesData } = this;
+    contentEl.createEl("h2", { text: `Sources for: ${sourcesData.concept}` });
+    const metaEl = contentEl.createEl("div", { cls: "sources-meta" });
+    metaEl.style.cssText = "margin-bottom: 20px; padding: 10px; background: var(--background-secondary); border-radius: 5px;";
+    if (sourcesData.section_matched) {
+      metaEl.createEl("p", { text: `\u{1F4CD} From section: "${sourcesData.section_matched}"` });
+    }
+    metaEl.createEl("p", { text: `Found ${sourcesData.total_sources} source${sourcesData.total_sources !== 1 ? "s" : ""} from your Oracle research` });
+    const infoEl = contentEl.createEl("div", { cls: "info-callout" });
+    infoEl.style.cssText = "margin-bottom: 15px; padding: 10px; background: rgba(var(--color-green-rgb), 0.1); border-left: 3px solid var(--text-success); border-radius: 3px;";
+    infoEl.createEl("p", {
+      text: "\u2713 These are the exact videos cited in your Training Review - not a new search.",
+      cls: "info-text"
+    });
+    contentEl.createEl("p", {
+      text: "Click any timestamp to generate a 60-second WebM clip:",
+      cls: "sources-instructions"
+    });
+    const listEl = contentEl.createEl("div", { cls: "sources-list" });
+    listEl.style.cssText = "max-height: 400px; overflow-y: auto;";
+    const sources = sourcesData.sources || [];
+    if (sources.length === 0) {
+      listEl.createEl("p", { text: "No linked sources found for this concept." });
+    }
+    for (const source of sources) {
+      const sourceEl = listEl.createEl("div", { cls: "source-item" });
+      const borderColor = source.relevance === "high" ? "var(--text-success)" : source.relevance === "medium" ? "var(--text-warning)" : "var(--text-muted)";
+      sourceEl.style.cssText = `padding: 12px; margin: 8px 0; border-radius: 5px; background: var(--background-secondary); cursor: pointer; border-left: 3px solid ${borderColor};`;
+      const headerRow = sourceEl.createEl("div", { cls: "source-header" });
+      headerRow.style.cssText = "display: flex; align-items: center; gap: 10px;";
+      const timestampBadge = headerRow.createEl("span", { cls: "timestamp-badge" });
+      timestampBadge.style.cssText = "display: inline-block; background: var(--interactive-accent); color: white; padding: 2px 8px; border-radius: 3px; font-family: monospace;";
+      timestampBadge.textContent = source.timestamp || "0:00";
+      headerRow.createEl("strong", { text: source.video_title || "Unknown Video" });
+      const instructorEl = sourceEl.createEl("p", { cls: "source-instructor" });
+      instructorEl.style.cssText = "margin: 5px 0; font-size: 0.9em; color: var(--text-accent);";
+      instructorEl.textContent = `\u{1F464} ${source.instructor || "Unknown"}`;
+      if (source.context) {
+        const contextEl = sourceEl.createEl("p", { cls: "source-context" });
+        contextEl.style.cssText = "margin-top: 5px; font-size: 0.85em; color: var(--text-muted); font-style: italic;";
+        contextEl.textContent = `"${source.context.substring(0, 150)}${source.context.length > 150 ? "..." : ""}"`;
+      }
+      sourceEl.addEventListener("click", async () => {
+        var _a;
+        timestampBadge.textContent = "Generating...";
+        timestampBadge.style.background = "var(--text-warning)";
+        const clipsFolder = `${((_a = this.sourceFile.parent) == null ? void 0 : _a.path) || this.plugin.settings.syncFolder}/clips/${source.video_id}`;
+        const clipPath = await this.plugin.generateClipOnDemand(
+          source.video_id,
+          source.timestamp_seconds || 0,
+          clipsFolder
+        );
+        if (clipPath) {
+          timestampBadge.textContent = "Done!";
+          timestampBadge.style.background = "var(--text-success)";
+          new import_obsidian.Notice(`Clip saved: ${clipPath}`, 3e3);
+          const clipFile = this.app.vault.getAbstractFileByPath(clipPath);
+          if (clipFile instanceof import_obsidian.TFile) {
+            await this.app.workspace.getLeaf("split").openFile(clipFile);
+          }
+        } else {
+          timestampBadge.textContent = "Failed";
+          timestampBadge.style.background = "var(--text-error)";
+          new import_obsidian.Notice("Failed to generate clip", 3e3);
+        }
+        setTimeout(() => {
+          timestampBadge.textContent = source.timestamp || "0:00";
+          timestampBadge.style.background = "var(--interactive-accent)";
+        }, 3e3);
+      });
+      sourceEl.addEventListener("mouseenter", () => {
+        sourceEl.style.background = "var(--background-modifier-hover)";
+      });
+      sourceEl.addEventListener("mouseleave", () => {
+        sourceEl.style.background = "var(--background-secondary)";
+      });
+    }
+    const footerEl = contentEl.createEl("div", { cls: "modal-footer" });
+    footerEl.style.cssText = "margin-top: 20px; display: flex; gap: 10px;";
+    new import_obsidian.Setting(footerEl).addButton((btn) => btn.setButtonText("Generate All Clips").setCta().onClick(async () => {
+      var _a;
+      btn.setButtonText("Generating...");
+      btn.setDisabled(true);
+      let generated = 0;
+      for (const source of sources) {
+        const clipsFolder = `${((_a = this.sourceFile.parent) == null ? void 0 : _a.path) || this.plugin.settings.syncFolder}/clips/${source.video_id}`;
+        const clipPath = await this.plugin.generateClipOnDemand(
+          source.video_id,
+          source.timestamp_seconds || 0,
+          clipsFolder
+        );
+        if (clipPath)
+          generated++;
+      }
+      new import_obsidian.Notice(`Generated ${generated}/${sources.length} clips!`, 5e3);
+      btn.setButtonText("Done!");
+      setTimeout(() => this.close(), 2e3);
+    })).addButton((btn) => btn.setButtonText("Try Semantic Search").onClick(async () => {
+      this.close();
+      new import_obsidian.Notice("Trying semantic search...", 2e3);
+      try {
+        const response = await (0, import_obsidian.requestUrl)({
+          url: `${this.plugin.settings.serverUrl}/api/obsidian/explore-video`,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${this.plugin.settings.apiToken}`
+          },
+          body: JSON.stringify({ concept: sourcesData.concept })
+        });
+        const data = response.json;
+        if (!data.error) {
+          const modal = new VideoExplorerModal(
+            this.app,
+            this.plugin,
+            data,
+            this.sourceFile
+          );
+          modal.open();
+        } else {
+          new import_obsidian.Notice("No videos found via semantic search", 3e3);
+        }
+      } catch (error) {
+        new import_obsidian.Notice(`Search failed: ${error.message}`, 3e3);
+      }
+    })).addButton((btn) => btn.setButtonText("Close").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var VideoExplorerModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, videoData, sourceFile) {
+    super(app);
+    this.plugin = plugin;
+    this.videoData = videoData;
+    this.sourceFile = sourceFile;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    const { videoData } = this;
+    contentEl.createEl("h2", { text: `Video: ${videoData.title || "Unknown"}` });
+    const metaEl = contentEl.createEl("div", { cls: "video-meta" });
+    metaEl.style.cssText = "margin-bottom: 20px; padding: 10px; background: var(--background-secondary); border-radius: 5px;";
+    metaEl.createEl("p", { text: `Instructor: ${videoData.instructor || "Unknown"}` });
+    metaEl.createEl("p", { text: `Video ID: ${videoData.video_id}` });
+    metaEl.createEl("p", { text: `Found ${videoData.total_techniques || 0} techniques with timestamps` });
+    contentEl.createEl("p", {
+      text: "Click any timestamp to generate a 60-second WebM clip:",
+      cls: "video-explorer-instructions"
+    });
+    const listEl = contentEl.createEl("div", { cls: "techniques-list" });
+    listEl.style.cssText = "max-height: 400px; overflow-y: auto;";
+    const techniques = videoData.techniques || [];
+    if (techniques.length === 0) {
+      listEl.createEl("p", { text: "No timestamped techniques found in this video." });
+    }
+    for (const tech of techniques) {
+      const techEl = listEl.createEl("div", { cls: "technique-item" });
+      techEl.style.cssText = "padding: 12px; margin: 8px 0; border-radius: 5px; background: var(--background-secondary); cursor: pointer; border-left: 3px solid var(--interactive-accent);";
+      const timestampBadge = techEl.createEl("span", { cls: "timestamp-badge" });
+      timestampBadge.style.cssText = "display: inline-block; background: var(--interactive-accent); color: white; padding: 2px 8px; border-radius: 3px; font-family: monospace; margin-right: 10px;";
+      timestampBadge.textContent = tech.timestamp || "0:00";
+      techEl.createEl("strong", { text: tech.name || "Untitled" });
+      if (tech.description) {
+        const descEl = techEl.createEl("p", { cls: "technique-description" });
+        descEl.style.cssText = "margin-top: 5px; font-size: 0.9em; color: var(--text-muted);";
+        descEl.textContent = tech.description.substring(0, 200) + (tech.description.length > 200 ? "..." : "");
+      }
+      techEl.addEventListener("click", async () => {
+        var _a;
+        timestampBadge.textContent = "Generating...";
+        timestampBadge.style.background = "var(--text-warning)";
+        const clipsFolder = `${((_a = this.sourceFile.parent) == null ? void 0 : _a.path) || this.plugin.settings.syncFolder}/clips/${this.videoData.video_id}`;
+        const clipPath = await this.plugin.generateClipOnDemand(
+          videoData.video_id,
+          tech.timestamp_seconds || 0,
+          clipsFolder
+        );
+        if (clipPath) {
+          timestampBadge.textContent = "Done!";
+          timestampBadge.style.background = "var(--text-success)";
+          new import_obsidian.Notice(`Clip saved: ${clipPath}`, 3e3);
+          const clipFile = this.app.vault.getAbstractFileByPath(clipPath);
+          if (clipFile instanceof import_obsidian.TFile) {
+            await this.app.workspace.getLeaf("split").openFile(clipFile);
+          }
+        } else {
+          timestampBadge.textContent = "Failed";
+          timestampBadge.style.background = "var(--text-error)";
+          new import_obsidian.Notice("Failed to generate clip", 3e3);
+        }
+        setTimeout(() => {
+          timestampBadge.textContent = tech.timestamp || "0:00";
+          timestampBadge.style.background = "var(--interactive-accent)";
+        }, 3e3);
+      });
+      techEl.addEventListener("mouseenter", () => {
+        techEl.style.background = "var(--background-modifier-hover)";
+      });
+      techEl.addEventListener("mouseleave", () => {
+        techEl.style.background = "var(--background-secondary)";
+      });
+    }
+    const footerEl = contentEl.createEl("div", { cls: "modal-footer" });
+    footerEl.style.cssText = "margin-top: 20px; display: flex; gap: 10px;";
+    new import_obsidian.Setting(footerEl).addButton((btn) => btn.setButtonText("Expand to Full Series").onClick(async () => {
+      btn.setButtonText("Loading...");
+      btn.setDisabled(true);
+      try {
+        const response = await (0, import_obsidian.requestUrl)({
+          url: `${this.plugin.settings.serverUrl}/api/obsidian/explore-series`,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${this.plugin.settings.apiToken}`
+          },
+          body: JSON.stringify({
+            concept: this.videoData.concept_searched || this.videoData.title,
+            instructor: this.videoData.instructor
+          })
+        });
+        const seriesData = response.json;
+        if (seriesData.error) {
+          new import_obsidian.Notice("No series found", 3e3);
+          btn.setButtonText("Expand to Full Series");
+          btn.setDisabled(false);
+          return;
+        }
+        this.close();
+        const seriesModal = new SeriesExplorerModal(
+          this.app,
+          this.plugin,
+          seriesData,
+          this.sourceFile
+        );
+        seriesModal.open();
+      } catch (error) {
+        new import_obsidian.Notice(`Failed to load series: ${error.message}`, 3e3);
+        btn.setButtonText("Expand to Full Series");
+        btn.setDisabled(false);
+      }
+    })).addButton((btn) => btn.setButtonText("Generate All Clips").setCta().onClick(async () => {
+      var _a;
+      btn.setButtonText("Generating...");
+      btn.setDisabled(true);
+      const clipsFolder = `${((_a = this.sourceFile.parent) == null ? void 0 : _a.path) || this.plugin.settings.syncFolder}/clips/${this.videoData.video_id}`;
+      let generated = 0;
+      for (const tech of techniques) {
+        const clipPath = await this.plugin.generateClipOnDemand(
+          videoData.video_id,
+          tech.timestamp_seconds || 0,
+          clipsFolder
+        );
+        if (clipPath)
+          generated++;
+      }
+      new import_obsidian.Notice(`Generated ${generated}/${techniques.length} clips!`, 5e3);
+      btn.setButtonText("Done!");
+      setTimeout(() => this.close(), 2e3);
+    })).addButton((btn) => btn.setButtonText("Close").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var SeriesExplorerModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, seriesData, sourceFile) {
+    super(app);
+    this.plugin = plugin;
+    this.seriesData = seriesData;
+    this.sourceFile = sourceFile;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    const { seriesData } = this;
+    contentEl.createEl("h2", { text: `Series: ${seriesData.series_name || "Unknown"}` });
+    const metaEl = contentEl.createEl("div", { cls: "series-meta" });
+    metaEl.style.cssText = "margin-bottom: 20px; padding: 10px; background: var(--background-secondary); border-radius: 5px;";
+    metaEl.createEl("p", { text: `Instructor: ${seriesData.instructor || "Unknown"}` });
+    metaEl.createEl("p", { text: `Total Volumes: ${seriesData.total_volumes || 0}` });
+    const volumesEl = contentEl.createEl("div", { cls: "volumes-list" });
+    volumesEl.style.cssText = "max-height: 500px; overflow-y: auto;";
+    const volumes = seriesData.volumes || [];
+    for (const vol of volumes) {
+      const volContainer = volumesEl.createEl("div", { cls: "volume-container" });
+      volContainer.style.cssText = "margin-bottom: 10px; border: 1px solid var(--background-modifier-border); border-radius: 5px;";
+      const volHeader = volContainer.createEl("div", { cls: "volume-header" });
+      volHeader.style.cssText = "padding: 12px; background: var(--interactive-accent); color: white; cursor: pointer; border-radius: 5px 5px 0 0; display: flex; justify-content: space-between; align-items: center;";
+      volHeader.createEl("strong", { text: `Volume ${vol.volume}: ${vol.title || ""}` });
+      const techCount = volHeader.createEl("span");
+      techCount.textContent = `${vol.total_techniques || 0} techniques`;
+      techCount.style.cssText = "font-size: 0.85em; opacity: 0.9;";
+      const techList = volContainer.createEl("div", { cls: "technique-list" });
+      techList.style.cssText = "display: none; padding: 10px; background: var(--background-primary);";
+      volHeader.addEventListener("click", () => {
+        const isVisible = techList.style.display !== "none";
+        techList.style.display = isVisible ? "none" : "block";
+        volHeader.style.borderRadius = isVisible ? "5px 5px 0 0" : "5px";
+      });
+      for (const tech of vol.techniques || []) {
+        const techEl = techList.createEl("div", { cls: "technique-item" });
+        techEl.style.cssText = "padding: 8px; margin: 4px 0; border-radius: 3px; background: var(--background-secondary); cursor: pointer; border-left: 3px solid var(--text-accent);";
+        const timestampBadge = techEl.createEl("span");
+        timestampBadge.style.cssText = "display: inline-block; background: var(--text-accent); color: white; padding: 2px 6px; border-radius: 3px; font-family: monospace; font-size: 0.85em; margin-right: 8px;";
+        timestampBadge.textContent = tech.timestamp || "0:00";
+        techEl.createEl("span", { text: tech.name || "Untitled" });
+        techEl.addEventListener("click", async (e) => {
+          var _a;
+          e.stopPropagation();
+          timestampBadge.textContent = "...";
+          timestampBadge.style.background = "var(--text-warning)";
+          const clipsFolder = `${((_a = this.sourceFile.parent) == null ? void 0 : _a.path) || this.plugin.settings.syncFolder}/clips/${vol.video_id}`;
+          const clipPath = await this.plugin.generateClipOnDemand(
+            vol.video_id,
+            tech.timestamp_seconds || 0,
+            clipsFolder
+          );
+          if (clipPath) {
+            timestampBadge.textContent = "OK";
+            timestampBadge.style.background = "var(--text-success)";
+            new import_obsidian.Notice(`Clip saved!`, 2e3);
+          } else {
+            timestampBadge.textContent = "X";
+            timestampBadge.style.background = "var(--text-error)";
+          }
+          setTimeout(() => {
+            timestampBadge.textContent = tech.timestamp || "0:00";
+            timestampBadge.style.background = "var(--text-accent)";
+          }, 2e3);
+        });
+        techEl.addEventListener("mouseenter", () => techEl.style.background = "var(--background-modifier-hover)");
+        techEl.addEventListener("mouseleave", () => techEl.style.background = "var(--background-secondary)");
+      }
+    }
+    new import_obsidian.Setting(contentEl).addButton((btn) => btn.setButtonText("Close").onClick(() => this.close()));
   }
   onClose() {
     this.contentEl.empty();
@@ -4252,7 +7703,7 @@ var BJJFlipmodeSettingTab = class extends import_obsidian.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Flipmode Settings" });
-    new import_obsidian.Setting(containerEl).setName("Mode").setDesc("Local: Direct Oracle. Remote: Athlete sending to coach. Coach: Process athlete queries.").addDropdown((dropdown) => dropdown.addOption("local", "Local (Direct Oracle)").addOption("remote", "Remote (Athlete)").addOption("coach", "Coach (Process Queries)").setValue(this.plugin.settings.mode).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Mode").setDesc("Local: Direct Oracle. Remote: Athlete sending to Oracle. Coach: Process athlete queries.").addDropdown((dropdown) => dropdown.addOption("local", "Local (Direct Oracle)").addOption("remote", "Remote (Athlete)").addOption("coach", "Coach (Process Queries)").setValue(this.plugin.settings.mode).onChange(async (value) => {
       this.plugin.settings.mode = value;
       await this.plugin.saveSettings();
       this.display();
@@ -4300,11 +7751,11 @@ var BJJFlipmodeSettingTab = class extends import_obsidian.PluginSettingTab {
       }));
     } else if (this.plugin.settings.mode === "remote") {
       containerEl.createEl("h3", { text: "Remote Mode Settings (Athlete)" });
-      new import_obsidian.Setting(containerEl).setName("Queue Service URL").setDesc("URL of the coach queue service (e.g., https://your-app.herokuapp.com)").addText((text) => text.setPlaceholder("https://flipmode-queue.herokuapp.com").setValue(this.plugin.settings.queueServiceUrl).onChange(async (value) => {
+      new import_obsidian.Setting(containerEl).setName("Queue Service URL").setDesc("URL of the Oracle queue service (e.g., https://your-app.herokuapp.com)").addText((text) => text.setPlaceholder("https://flipmode-queue.herokuapp.com").setValue(this.plugin.settings.queueServiceUrl).onChange(async (value) => {
         this.plugin.settings.queueServiceUrl = value;
         await this.plugin.saveSettings();
       }));
-      new import_obsidian.Setting(containerEl).setName("Connect with Discord").setDesc("Authenticate with your coach via Discord").addButton((btn) => btn.setButtonText("Connect Discord").setCta().onClick(async () => {
+      new import_obsidian.Setting(containerEl).setName("Connect with Discord").setDesc("Authenticate via Discord to connect with Oracle").addButton((btn) => btn.setButtonText("Connect Discord").setCta().onClick(async () => {
         await this.plugin.connectWithDiscord();
       }));
       new import_obsidian.Setting(containerEl).setName("Athlete Token").setDesc("Your athlete token (obtained after Discord connection)").addText((text) => text.setPlaceholder("Paste token from Discord auth").setValue(this.plugin.settings.athleteToken).onChange(async (value) => {
@@ -4321,7 +7772,7 @@ var BJJFlipmodeSettingTab = class extends import_obsidian.PluginSettingTab {
           this.plugin.startResultPolling();
         }
       }));
-      new import_obsidian.Setting(containerEl).setName("Test Queue Connection").setDesc("Verify connection to coach queue").addButton((btn) => btn.setButtonText("Test").onClick(async () => {
+      new import_obsidian.Setting(containerEl).setName("Test Queue Connection").setDesc("Verify connection to Oracle queue").addButton((btn) => btn.setButtonText("Test").onClick(async () => {
         if (!this.plugin.settings.queueServiceUrl) {
           new import_obsidian.Notice("Configure Queue Service URL first");
           return;
@@ -4337,10 +7788,10 @@ var BJJFlipmodeSettingTab = class extends import_obsidian.PluginSettingTab {
           new import_obsidian.Notice("Failed to connect to queue service");
         }
       }));
-      new import_obsidian.Setting(containerEl).setName("Pending Queries").setDesc("View your pending coach queries").addButton((btn) => btn.setButtonText("View Jobs").onClick(() => {
+      new import_obsidian.Setting(containerEl).setName("Pending Queries").setDesc("View your pending Oracle queries").addButton((btn) => btn.setButtonText("View Jobs").onClick(() => {
         this.plugin.showPendingJobsModal();
       }));
-      new import_obsidian.Setting(containerEl).setName("Sync Graph").setDesc("Send your research graph to your coach").addButton((btn) => btn.setButtonText("Sync Now").onClick(async () => {
+      new import_obsidian.Setting(containerEl).setName("Sync Graph").setDesc("Send your research graph to Oracle").addButton((btn) => btn.setButtonText("Sync Now").onClick(async () => {
         await this.plugin.syncGraphToCoach();
       }));
     } else if (this.plugin.settings.mode === "coach") {
@@ -4384,6 +7835,10 @@ var BJJFlipmodeSettingTab = class extends import_obsidian.PluginSettingTab {
     containerEl.createEl("h3", { text: "General Settings" });
     new import_obsidian.Setting(containerEl).setName("Sync Folder").setDesc("Folder in your vault for Flipmode content").addText((text) => text.setPlaceholder("Flipmode").setValue(this.plugin.settings.syncFolder).onChange(async (value) => {
       this.plugin.settings.syncFolder = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("Concepts Subfolder").setDesc('Subfolder for concept graphs (e.g., "concepts" \u2192 {syncFolder}/concepts/{topic}/)').addText((text) => text.setPlaceholder("concepts").setValue(this.plugin.settings.conceptsSubfolder).onChange(async (value) => {
+      this.plugin.settings.conceptsSubfolder = value || "concepts";
       await this.plugin.saveSettings();
     }));
     new import_obsidian.Setting(containerEl).setName("Auto Sync").setDesc("Automatically sync with Flipmode periodically").addToggle((toggle) => toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {

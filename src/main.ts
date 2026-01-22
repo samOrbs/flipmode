@@ -1,4 +1,4 @@
-import { App, Editor, MarkdownView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, requestUrl } from 'obsidian';
+import { App, Editor, MarkdownView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, requestUrl, ItemView } from 'obsidian';
 import { FLIPMODE_HEADER_BASE64 } from './header-asset';
 
 // Plugin settings interface
@@ -21,6 +21,8 @@ interface BJJFlipmodeSettings {
     currentEpisode: number;
     // Athlete identity (for coach to know whose notes these are)
     athleteName: string;
+    // Concepts folder structure
+    conceptsSubfolder: string;
 }
 
 const DEFAULT_SETTINGS: BJJFlipmodeSettings = {
@@ -41,7 +43,9 @@ const DEFAULT_SETTINGS: BJJFlipmodeSettings = {
     currentSeason: 1,
     currentEpisode: 1,
     // Athlete identity
-    athleteName: 'Athlete'
+    athleteName: 'Athlete',
+    // Concepts folder structure
+    conceptsSubfolder: 'concepts'
 };
 
 // Pending job for tracking remote queries
@@ -284,6 +288,24 @@ class CoachQueueClient {
         });
         return response.json;
     }
+
+    async shareConceptGraph(athleteId: number, conceptName: string, conceptSummary: string, graphData: any): Promise<{ success: boolean; message: string }> {
+        const response = await requestUrl({
+            url: `${this.baseUrl}/api/coach/share-concept-graph`,
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${this.token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                athlete_id: athleteId,
+                concept_name: conceptName,
+                concept_summary: conceptSummary,
+                graph_data: graphData
+            })
+        });
+        return response.json;
+    }
 }
 
 export default class BJJFlipmodePlugin extends Plugin {
@@ -307,6 +329,14 @@ export default class BJJFlipmodePlugin extends Plugin {
         // Add ribbon icon
         this.addRibbonIcon('brain-circuit', 'Flipmode', async () => {
             await this.showFlipmodeMenu();
+        });
+
+        // Register custom URI handler for sync-and-open from Discord links
+        this.registerObsidianProtocolHandler('flipmode-sync', async (params) => {
+            const conceptName = params.concept;
+            if (conceptName) {
+                await this.syncAndOpenConcept(conceptName);
+            }
         });
 
         // Add commands
@@ -426,9 +456,41 @@ export default class BJJFlipmodePlugin extends Plugin {
         // Athlete: Sync completed research from coach
         this.addCommand({
             id: 'flipmode-sync-from-coach',
-            name: 'Sync from Coach (fetch completed research)',
+            name: 'Sync from Oracle (fetch completed research)',
             callback: async () => {
                 await this.syncFromCoach();
+            }
+        });
+
+        // Find Video for Canvas Node - works when Canvas is active
+        this.addCommand({
+            id: 'flipmode-find-video-canvas',
+            name: 'Find Video for Selected Concept (Canvas)',
+            checkCallback: (checking: boolean) => {
+                const canvasView = this.app.workspace.getActiveViewOfType(ItemView);
+                if (canvasView && canvasView.getViewType() === 'canvas') {
+                    if (!checking) {
+                        this.findVideoForCanvasNode(canvasView);
+                    }
+                    return true;
+                }
+                return false;
+            }
+        });
+
+        // RLM Enrich & Rebuild - single button for full pipeline
+        this.addCommand({
+            id: 'flipmode-rlm-pipeline',
+            name: 'RLM: Enrich & Rebuild Canvas',
+            checkCallback: (checking: boolean) => {
+                const canvasView = this.app.workspace.getActiveViewOfType(ItemView);
+                if (canvasView && canvasView.getViewType() === 'canvas') {
+                    if (!checking) {
+                        this.runRLMPipeline(canvasView);
+                    }
+                    return true;
+                }
+                return false;
             }
         });
 
@@ -478,13 +540,124 @@ export default class BJJFlipmodePlugin extends Plugin {
             })
         );
 
+        // Right-click menu on Canvas nodes
+        this.registerEvent(
+            this.app.workspace.on('canvas:node-menu', (menu: Menu, node: any) => {
+                // Check if this node has linked sources (from Oracle article)
+                let hasLinkedSources = false;
+                let sessionId: string | null = null;
+
+                if (node.file) {
+                    const cache = this.app.metadataCache.getFileCache(node.file);
+                    if (cache?.frontmatter?.source_rlm_session) {
+                        hasLinkedSources = true;
+                        sessionId = cache.frontmatter.source_rlm_session;
+                    }
+                }
+
+                if (hasLinkedSources && sessionId) {
+                    // Show bibliography from parent Oracle article
+                    menu.addItem((item) => {
+                        item
+                            .setTitle('View Source Videos')
+                            .setIcon('library')
+                            .onClick(async () => {
+                                await this.showArticleBibliography(node, sessionId!);
+                            });
+                    });
+                }
+
+                // Always show semantic search as fallback
+                menu.addItem((item) => {
+                    item
+                        .setTitle('Search Videos (Semantic)')
+                        .setIcon('search')
+                        .onClick(async () => {
+                            await this.findVideoForCanvasNodeDirect(node);
+                        });
+                });
+
+                menu.addItem((item) => {
+                    item
+                        .setTitle('Explore Full Series')
+                        .setIcon('layers')
+                        .onClick(async () => {
+                            await this.exploreSeriesForCanvasNode(node);
+                        });
+                });
+
+                // Cross-reference with catalog
+                menu.addItem((item) => {
+                    item
+                        .setTitle('Cross-Reference with Catalog')
+                        .setIcon('git-compare')
+                        .onClick(async () => {
+                            await this.openCrossReferenceCatalog(node);
+                        });
+                });
+
+                // RLM Enrichment - only for checkpoint files
+                if (node.file) {
+                    const cache = this.app.metadataCache.getFileCache(node.file);
+                    if (cache?.frontmatter?.type === 'checkpoint') {
+                        menu.addItem((item) => {
+                            item
+                                .setTitle('Enrich Checkpoint (RLM)')
+                                .setIcon('sparkles')
+                                .onClick(async () => {
+                                    await this.openEnrichCheckpoint(node);
+                                });
+                        });
+                    }
+
+                    // Extract Clip - for method nodes with timestamp
+                    if (cache?.frontmatter?.type === 'method' && cache.frontmatter.timestamp) {
+                        menu.addItem((item) => {
+                            item
+                                .setTitle('Extract WebM Clip')
+                                .setIcon('video')
+                                .onClick(async () => {
+                                    await this.extractClipFromMethod(node.file, cache.frontmatter);
+                                });
+                        });
+                    }
+                }
+            })
+        );
+
         // Right-click menu on files in file explorer
         this.registerEvent(
             this.app.workspace.on('file-menu', (menu: Menu, file: TFile) => {
-                // Only show for markdown files
-                if (!(file instanceof TFile) || file.extension !== 'md') return;
+                if (!(file instanceof TFile)) return;
 
-                // Add "Get Training Drills" option for concept files
+                // Canvas files - share with athlete
+                if (file.extension === 'canvas') {
+                    if (this.settings.mode === 'coach' && this.coachClient) {
+                        menu.addItem((item) => {
+                            item
+                                .setTitle('Share Canvas with Athlete')
+                                .setIcon('send')
+                                .onClick(async () => {
+                                    await this.shareCanvasWithAthlete(file);
+                                });
+                        });
+                    }
+                    return;
+                }
+
+                // Only show rest for markdown files
+                if (file.extension !== 'md') return;
+
+                // Check if we're in a Canvas view - if so, skip these (canvas:node-menu handles it)
+                const activeView = this.app.workspace.getActiveViewOfType(ItemView);
+                const isCanvasView = activeView && activeView.getViewType() === 'canvas';
+
+                if (isCanvasView) {
+                    // Canvas has its own menu - don't duplicate
+                    return;
+                }
+
+                // File explorer right-click menu (not Canvas)
                 menu.addItem((item) => {
                     item
                         .setTitle('Get Training Drills')
@@ -493,6 +666,27 @@ export default class BJJFlipmodePlugin extends Plugin {
                             await this.getTrainingDrillsForConcept(file);
                         });
                 });
+
+                menu.addItem((item) => {
+                    item
+                        .setTitle('Research This Concept')
+                        .setIcon('search')
+                        .onClick(async () => {
+                            await this.researchConcept(file);
+                        });
+                });
+
+                // Coach mode only
+                if (this.settings.mode === 'coach' && this.coachClient) {
+                    menu.addItem((item) => {
+                        item
+                            .setTitle('Share with Athlete via Discord')
+                            .setIcon('send')
+                            .onClick(async () => {
+                                await this.shareConceptGraphWithAthlete(file);
+                            });
+                    });
+                }
             })
         );
 
@@ -664,6 +858,1471 @@ ${job.query_text}
 *Run "Coach: Generate article" to populate this section*
 
 `;
+    }
+
+    async shareConceptGraphWithAthlete(file: TFile) {
+        if (!this.coachClient) {
+            new Notice('Coach mode not configured');
+            return;
+        }
+
+        // Read file content to determine if it's a concept/cluster file
+        const content = await this.app.vault.read(file);
+        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+
+        if (!frontmatterMatch) {
+            new Notice('No frontmatter found');
+            return;
+        }
+
+        const fm = frontmatterMatch[1];
+        const isCluster = fm.includes('type: cluster-index');
+        const isConcept = fm.includes('type: concept');
+
+        if (!isCluster && !isConcept) {
+            new Notice('This file is not a concept or cluster file');
+            return;
+        }
+
+        // Get athletes list for selection
+        try {
+            const athletes = await this.coachClient.getAthletes();
+
+            if (athletes.length === 0) {
+                new Notice('No athletes found. Add athletes first.');
+                return;
+            }
+
+            // Create selection modal
+            const modal = new AthleteSelectModal(this.app, athletes, async (selectedAthlete) => {
+                if (!selectedAthlete) return;
+
+                // Collect concept graph data
+                let graphData: any = {};
+                let conceptName = file.basename;
+                let conceptSummary = '';
+
+                if (isCluster) {
+                    // Get all concepts in this cluster folder
+                    const clusterFolder = file.parent?.path || '';
+                    const conceptFiles = this.app.vault.getMarkdownFiles().filter(f =>
+                        f.path.startsWith(clusterFolder) && f.path !== file.path
+                    );
+
+                    const concepts = [];
+                    for (const cf of conceptFiles) {
+                        const cfContent = await this.app.vault.read(cf);
+                        concepts.push({
+                            name: cf.basename,
+                            content: cfContent
+                        });
+                    }
+
+                    graphData = {
+                        type: 'cluster',
+                        clusterName: conceptName,
+                        concepts: concepts,
+                        indexContent: content
+                    };
+
+                    // Extract summary from cluster index
+                    const summaryMatch = content.match(/## Summary\n\n([\s\S]*?)(?=\n## |$)/);
+                    conceptSummary = summaryMatch ? summaryMatch[1].trim().substring(0, 200) : '';
+                } else {
+                    // Single concept
+                    graphData = {
+                        type: 'concept',
+                        conceptName: conceptName,
+                        content: content
+                    };
+
+                    const summaryMatch = content.match(/## Summary\n\n([\s\S]*?)(?=\n## |$)/);
+                    conceptSummary = summaryMatch ? summaryMatch[1].trim().substring(0, 200) : '';
+                }
+
+                // Send to queue service
+                new Notice(`Sharing "${conceptName}" with ${selectedAthlete.display_name || selectedAthlete.discord_username}...`);
+
+                try {
+                    const result = await this.coachClient!.shareConceptGraph(
+                        selectedAthlete.id,
+                        conceptName,
+                        conceptSummary,
+                        graphData
+                    );
+
+                    if (result.success) {
+                        new Notice(`Shared with ${selectedAthlete.display_name || selectedAthlete.discord_username}`);
+                    } else {
+                        new Notice(`Saved but Discord notification failed: ${result.message}`);
+                    }
+                } catch (error: any) {
+                    new Notice(`Failed to share: ${error.message}`);
+                }
+            });
+
+            modal.open();
+
+        } catch (error: any) {
+            new Notice(`Failed to get athletes: ${error.message}`);
+        }
+    }
+
+    async shareCanvasWithAthlete(file: TFile) {
+        if (!this.coachClient) {
+            new Notice('Coach mode not configured');
+            return;
+        }
+
+        // Read canvas content
+        const content = await this.app.vault.read(file);
+        let canvasData: any;
+        try {
+            canvasData = JSON.parse(content);
+        } catch (e) {
+            new Notice('Invalid canvas file');
+            return;
+        }
+
+        const canvasName = file.basename;
+
+        // Get athletes list
+        try {
+            const athletes = await this.coachClient.getAthletes();
+
+            if (athletes.length === 0) {
+                new Notice('No athletes found. Add athletes first.');
+                return;
+            }
+
+            // Create selection modal
+            const modal = new AthleteSelectModal(this.app, athletes, async (selectedAthlete) => {
+                if (!selectedAthlete) return;
+
+                new Notice(`Sharing canvas "${canvasName}" with ${selectedAthlete.display_name || selectedAthlete.discord_username}...`);
+
+                try {
+                    const result = await this.coachClient!.shareConceptGraph(
+                        selectedAthlete.id,
+                        canvasName + ' (Timeline)',
+                        'Visual timeline canvas for training sequence',
+                        {
+                            type: 'canvas',
+                            canvasName: canvasName,
+                            nodes: canvasData.nodes || [],
+                            edges: canvasData.edges || []
+                        }
+                    );
+
+                    if (result.success) {
+                        new Notice(`Shared with ${selectedAthlete.display_name || selectedAthlete.discord_username}!`);
+                    } else {
+                        new Notice(`Saved but Discord notification failed: ${result.message}`);
+                    }
+                } catch (error: any) {
+                    new Notice(`Failed to share: ${error.message}`);
+                }
+            });
+
+            modal.open();
+
+        } catch (error: any) {
+            new Notice(`Failed to get athletes: ${error.message}`);
+        }
+    }
+
+    /**
+     * Extract WebM video clips from a Training Review article and create a Canvas with embedded clips.
+     * Non-destructive: original videos are never modified, clips are created as new files.
+     */
+    async extractVideoClipsToCanvas(file: TFile) {
+        // Read file content
+        const content = await this.app.vault.read(file);
+
+        // Check if this is a training review
+        if (!content.includes('type: training-review')) {
+            new Notice('This command works on Training Review files');
+            return;
+        }
+
+        // Extract article HTML (the content after frontmatter)
+        const frontmatterEnd = content.indexOf('---', 4);
+        if (frontmatterEnd === -1) {
+            new Notice('No frontmatter found');
+            return;
+        }
+        const articleContent = content.substring(frontmatterEnd + 3);
+
+        new Notice('Extracting video clips... This may take a moment.', 5000);
+
+        try {
+            // Call the WebM extraction API
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/extract-clips-webm-from-article`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify({
+                    article_html: articleContent,
+                    duration: 60  // 1 minute clips
+                })
+            });
+
+            const data = response.json;
+            const clips = data.clips || [];
+
+            if (clips.length === 0) {
+                new Notice('No video clips found in article');
+                return;
+            }
+
+            new Notice(`Found ${clips.length} clips. Downloading...`, 5000);
+
+            // Create clips folder in vault
+            const reviewName = file.basename;
+            const clipsFolder = `${file.parent?.path || this.settings.syncFolder}/clips/${reviewName}`;
+            await this.ensureFolder(clipsFolder);
+
+            // Download each clip and save to vault
+            const savedClips: { path: string; clip: any }[] = [];
+            for (let i = 0; i < clips.length; i++) {
+                const clip = clips[i];
+                const clipFilename = `${clip.video_id}_${clip.start_time}s.webm`;
+                const clipPath = `${clipsFolder}/${clipFilename}`;
+
+                try {
+                    // Download clip binary
+                    const clipResponse = await requestUrl({
+                        url: `${this.settings.serverUrl}${clip.clip_url}`,
+                        method: 'GET'
+                    });
+
+                    // Save to vault as binary
+                    await this.app.vault.adapter.writeBinary(clipPath, clipResponse.arrayBuffer);
+                    savedClips.push({ path: clipPath, clip });
+
+                    new Notice(`Downloaded clip ${i + 1}/${clips.length}`, 2000);
+                } catch (clipErr) {
+                    console.error(`Failed to download clip ${clip.clip_id}:`, clipErr);
+                }
+            }
+
+            if (savedClips.length === 0) {
+                new Notice('Failed to download any clips');
+                return;
+            }
+
+            // Create Canvas with video clips
+            const canvasPath = `${file.parent?.path || this.settings.syncFolder}/${reviewName} - Video Clips.canvas`;
+
+            const nodes: any[] = [];
+            const edges: any[] = [];
+            let nodeId = 1;
+
+            // Layout: horizontal grid of video clips
+            const clipWidth = 400;
+            const clipHeight = 300;
+            const spacing = 50;
+            const cols = 3;
+
+            for (let i = 0; i < savedClips.length; i++) {
+                const { path, clip } = savedClips[i];
+                const row = Math.floor(i / cols);
+                const col = i % cols;
+
+                // Video node (link to local file)
+                nodes.push({
+                    id: `video-${nodeId++}`,
+                    type: 'file',
+                    file: path,
+                    x: col * (clipWidth + spacing),
+                    y: row * (clipHeight + spacing + 80),
+                    width: clipWidth,
+                    height: clipHeight,
+                    color: '5'  // Cyan for videos
+                });
+
+                // Label node below video
+                nodes.push({
+                    id: `label-${nodeId++}`,
+                    type: 'text',
+                    text: `**${clip.instructor}**\n${clip.title}\n_at ${clip.timestamp}_`,
+                    x: col * (clipWidth + spacing),
+                    y: row * (clipHeight + spacing + 80) + clipHeight + 10,
+                    width: clipWidth,
+                    height: 70,
+                    color: '0'
+                });
+            }
+
+            // Add title node
+            nodes.unshift({
+                id: 'title',
+                type: 'text',
+                text: `# Video Clips: ${reviewName}\n\n${savedClips.length} clips extracted from training review`,
+                x: 0,
+                y: -120,
+                width: cols * (clipWidth + spacing) - spacing,
+                height: 100,
+                color: '6'  // Purple for title
+            });
+
+            const canvasContent = JSON.stringify({ nodes, edges }, null, 2);
+
+            // Save canvas
+            const existingCanvas = this.app.vault.getAbstractFileByPath(canvasPath);
+            if (existingCanvas instanceof TFile) {
+                await this.app.vault.modify(existingCanvas, canvasContent);
+            } else {
+                await this.app.vault.create(canvasPath, canvasContent);
+            }
+
+            new Notice(`Created video canvas with ${savedClips.length} clips!`, 5000);
+
+            // Open the canvas
+            const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
+            if (canvasFile instanceof TFile) {
+                await this.app.workspace.getLeaf().openFile(canvasFile);
+            }
+
+        } catch (error: any) {
+            console.error('Video clip extraction error:', error);
+            new Notice(`Failed to extract clips: ${error.message}`, 5000);
+        }
+    }
+
+    /**
+     * Search videos for checkpoint/concept demonstrations.
+     * Uses semantic search to find videos that demonstrate a specific technique.
+     */
+    async searchVideosForConcept(conceptName: string, context?: string): Promise<any[]> {
+        try {
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/search-videos-for-concept`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify({
+                    concept: conceptName,
+                    context: context || '',
+                    max_results: 5
+                })
+            });
+
+            return response.json.videos || [];
+        } catch (error) {
+            console.error('Video search error:', error);
+            return [];
+        }
+    }
+
+    /**
+     * Find videos demonstrating a concept and create a canvas with clips.
+     * Uses semantic search (separate from Oracle) to find matching videos.
+     */
+    async findVideosForConcept(file: TFile) {
+        // Read file to get concept name and context
+        const content = await this.app.vault.read(file);
+
+        // Extract frontmatter
+        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+        if (!frontmatterMatch) {
+            new Notice('No frontmatter found');
+            return;
+        }
+
+        const frontmatter = frontmatterMatch[1];
+
+        // Get concept name (file basename or from frontmatter)
+        const conceptName = file.basename;
+
+        // Try to extract context from parent checkpoint or summary
+        const summaryMatch = content.match(/## Summary\n\n([^\n#]+)/);
+        const context = summaryMatch ? summaryMatch[1].trim() : '';
+
+        new Notice(`Searching for videos demonstrating "${conceptName}"...`, 5000);
+
+        try {
+            // Search for videos
+            const videos = await this.searchVideosForConcept(conceptName, context);
+
+            if (videos.length === 0) {
+                new Notice(`No videos found for "${conceptName}"`, 3000);
+                return;
+            }
+
+            new Notice(`Found ${videos.length} videos! Creating canvas...`, 3000);
+
+            // Create clips folder
+            const clipsFolder = `${file.parent?.path || this.settings.syncFolder}/clips/${conceptName}`;
+            await this.ensureFolder(clipsFolder);
+
+            // Download clips
+            const savedClips: { path: string; video: any }[] = [];
+            for (let i = 0; i < videos.length; i++) {
+                const video = videos[i];
+                if (!video.clip_url) continue;
+
+                const clipFilename = `${video.video_id}_${video.timestamp_seconds || 0}s.webm`;
+                const clipPath = `${clipsFolder}/${clipFilename}`;
+
+                try {
+                    const clipResponse = await requestUrl({
+                        url: `${this.settings.serverUrl}${video.clip_url}`,
+                        method: 'GET'
+                    });
+
+                    await this.app.vault.adapter.writeBinary(clipPath, clipResponse.arrayBuffer);
+                    savedClips.push({ path: clipPath, video });
+                    new Notice(`Downloaded clip ${i + 1}/${videos.length}`, 2000);
+                } catch (err) {
+                    console.error(`Failed to download clip:`, err);
+                }
+            }
+
+            if (savedClips.length === 0) {
+                new Notice('Failed to download any clips');
+                return;
+            }
+
+            // Create canvas with clips
+            const canvasPath = `${file.parent?.path || this.settings.syncFolder}/${conceptName} - Videos.canvas`;
+
+            const nodes: any[] = [];
+            let nodeId = 1;
+
+            const clipWidth = 400;
+            const clipHeight = 300;
+            const spacing = 50;
+            const cols = 2;
+
+            // Title node
+            nodes.push({
+                id: 'title',
+                type: 'text',
+                text: `# Videos: ${conceptName}\n\n${savedClips.length} videos demonstrating this technique`,
+                x: 0,
+                y: -120,
+                width: cols * (clipWidth + spacing) - spacing,
+                height: 100,
+                color: '6'
+            });
+
+            for (let i = 0; i < savedClips.length; i++) {
+                const { path, video } = savedClips[i];
+                const row = Math.floor(i / cols);
+                const col = i % cols;
+
+                // Video node
+                nodes.push({
+                    id: `video-${nodeId++}`,
+                    type: 'file',
+                    file: path,
+                    x: col * (clipWidth + spacing),
+                    y: row * (clipHeight + spacing + 80),
+                    width: clipWidth,
+                    height: clipHeight,
+                    color: '5'
+                });
+
+                // Label
+                nodes.push({
+                    id: `label-${nodeId++}`,
+                    type: 'text',
+                    text: `**${video.instructor || 'Unknown'}**\n${video.title || ''}\n_at ${video.timestamp || '0:00'}_\n\n${video.relevance_quote || ''}`,
+                    x: col * (clipWidth + spacing),
+                    y: row * (clipHeight + spacing + 80) + clipHeight + 10,
+                    width: clipWidth,
+                    height: 100,
+                    color: '0'
+                });
+            }
+
+            const canvasContent = JSON.stringify({ nodes, edges: [] }, null, 2);
+
+            const existingCanvas = this.app.vault.getAbstractFileByPath(canvasPath);
+            if (existingCanvas instanceof TFile) {
+                await this.app.vault.modify(existingCanvas, canvasContent);
+            } else {
+                await this.app.vault.create(canvasPath, canvasContent);
+            }
+
+            new Notice(`Created video canvas for "${conceptName}"!`, 5000);
+
+            // Open canvas
+            const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
+            if (canvasFile instanceof TFile) {
+                await this.app.workspace.getLeaf().openFile(canvasFile);
+            }
+
+        } catch (error: any) {
+            console.error('Find videos error:', error);
+            new Notice(`Failed to find videos: ${error.message}`, 5000);
+        }
+    }
+
+    /**
+     * Video Explorer: Show video breakdown with clickable timestamps.
+     * Click a timestamp to generate a clip on-demand.
+     */
+    async exploreVideoForConcept(file: TFile) {
+        const content = await this.app.vault.read(file);
+        const conceptName = file.basename;
+
+        // Extract context from summary if available
+        const summaryMatch = content.match(/## Summary\n\n([^\n#]+)/);
+        const context = summaryMatch ? summaryMatch[1].trim() : '';
+
+        new Notice(`Searching for videos about "${conceptName}"...`, 3000);
+
+        try {
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/explore-video`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify({
+                    concept: conceptName,
+                    context: context
+                })
+            });
+
+            const data = response.json;
+
+            if (data.error) {
+                new Notice(`No videos found for "${conceptName}"`, 3000);
+                return;
+            }
+
+            // Open the Video Explorer modal
+            const modal = new VideoExplorerModal(
+                this.app,
+                this,
+                data,
+                file
+            );
+            modal.open();
+
+        } catch (error: any) {
+            console.error('Video explorer error:', error);
+            new Notice(`Failed to explore videos: ${error.message}`, 5000);
+        }
+    }
+
+    /**
+     * Find video for Canvas node (right-click menu).
+     * First tries to find linked sources from parent article, falls back to semantic search.
+     */
+    async findVideoForCanvasNodeDirect(node: any) {
+        let conceptName = '';
+        let sourceFile: TFile | null = null;
+        let sessionId: string | null = null;
+
+        if (node.file) {
+            sourceFile = node.file;
+            conceptName = sourceFile.basename;
+
+            // Try to get session_id from the file's frontmatter
+            const cache = this.app.metadataCache.getFileCache(sourceFile);
+            if (cache?.frontmatter?.source_rlm_session) {
+                sessionId = cache.frontmatter.source_rlm_session;
+            }
+        } else if (node.text) {
+            const text = node.text;
+            const match = text.match(/\*\*([^*]+)\*\*/) || text.match(/^#*\s*(.+)$/m);
+            conceptName = match ? match[1].trim() : text.substring(0, 50).trim();
+        } else if (node.label) {
+            conceptName = node.label;
+        }
+
+        if (!conceptName) {
+            new Notice('Could not get concept name from node');
+            return;
+        }
+
+        // If we have a session_id, use linked sources from the Oracle article
+        if (sessionId) {
+            new Notice(`Finding linked sources for "${conceptName}"...`, 3000);
+
+            try {
+                const response = await requestUrl({
+                    url: `${this.settings.serverUrl}/api/obsidian/sources-for-concept`,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${this.settings.apiToken}`
+                    },
+                    body: JSON.stringify({
+                        session_id: sessionId,
+                        concept_name: conceptName
+                    })
+                });
+
+                const data = response.json;
+
+                if (data.sources && data.sources.length > 0) {
+                    new Notice(`Found ${data.sources.length} linked sources!`, 3000);
+
+                    const modal = new LinkedSourcesModal(
+                        this.app,
+                        this,
+                        data,
+                        sourceFile || { path: this.settings.syncFolder, parent: null, basename: conceptName } as any
+                    );
+                    modal.open();
+                    return;
+                } else {
+                    new Notice('No linked sources found, trying semantic search...', 2000);
+                }
+            } catch (error: any) {
+                console.error('Linked sources error:', error);
+                new Notice('Linked sources failed, trying semantic search...', 2000);
+            }
+        }
+
+        // Fallback: semantic search
+        new Notice(`Searching for "${conceptName}"...`, 3000);
+
+        try {
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/explore-video`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify({ concept: conceptName })
+            });
+
+            const data = response.json;
+
+            if (data.error) {
+                new Notice(`No video found for "${conceptName}"`, 3000);
+                return;
+            }
+
+            const modal = new VideoExplorerModal(
+                this.app,
+                this,
+                data,
+                sourceFile || { path: this.settings.syncFolder, parent: null, basename: conceptName } as any
+            );
+            modal.open();
+
+        } catch (error: any) {
+            console.error('Canvas video finder error:', error);
+            new Notice(`Failed: ${error.message}`, 5000);
+        }
+    }
+
+    /**
+     * Explore series for Canvas node (right-click menu).
+     * Uses linked sources from parent article when available.
+     */
+    async exploreSeriesForCanvasNode(node: any) {
+        let conceptName = '';
+        let sourceFile: TFile | null = null;
+        let sessionId: string | null = null;
+
+        if (node.file) {
+            sourceFile = node.file;
+            conceptName = sourceFile.basename;
+
+            // Try to get session_id from the file's frontmatter
+            const cache = this.app.metadataCache.getFileCache(sourceFile);
+            if (cache?.frontmatter?.source_rlm_session) {
+                sessionId = cache.frontmatter.source_rlm_session;
+            }
+        } else if (node.text) {
+            const text = node.text;
+            const match = text.match(/\*\*([^*]+)\*\*/) || text.match(/^#*\s*(.+)$/m);
+            conceptName = match ? match[1].trim() : text.substring(0, 50).trim();
+        } else if (node.label) {
+            conceptName = node.label;
+        }
+
+        if (!conceptName) {
+            new Notice('Could not get concept name from node');
+            return;
+        }
+
+        new Notice(`Finding series for "${conceptName}"${sessionId ? ' (using linked sources)' : ''}...`, 3000);
+
+        try {
+            const requestBody: any = { concept: conceptName };
+            if (sessionId) {
+                requestBody.session_id = sessionId;
+            }
+
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/explore-series`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify(requestBody)
+            });
+
+            const data = response.json;
+
+            if (data.error) {
+                new Notice(`No series found for "${conceptName}"`, 3000);
+                return;
+            }
+
+            new Notice(`Found ${data.total_volumes} volumes!`, 3000);
+
+            const modal = new SeriesExplorerModal(
+                this.app,
+                this,
+                data,
+                sourceFile || { path: this.settings.syncFolder, parent: null, basename: conceptName } as any
+            );
+            modal.open();
+
+        } catch (error: any) {
+            console.error('Canvas series finder error:', error);
+            new Notice(`Failed: ${error.message}`, 5000);
+        }
+    }
+
+    /**
+     * Show the complete bibliography of videos from the parent Oracle article.
+     * User can select any video to see its full concept cache.
+     */
+    async showArticleBibliography(node: any, sessionId: string) {
+        let sourceFile: TFile | null = null;
+
+        if (node.file) {
+            sourceFile = node.file;
+        }
+
+        new Notice('Loading article bibliography...', 2000);
+
+        try {
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/article-bibliography`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify({ session_id: sessionId })
+            });
+
+            const data = response.json;
+
+            if (data.error) {
+                new Notice(`Error: ${data.error}`, 3000);
+                return;
+            }
+
+            new Notice(`Found ${data.total_videos} source videos!`, 3000);
+
+            const modal = new ArticleBibliographyModal(
+                this.app,
+                this,
+                data,
+                sourceFile || { path: this.settings.syncFolder, parent: null, basename: 'Article' } as any
+            );
+            modal.open();
+
+        } catch (error: any) {
+            console.error('Article bibliography error:', error);
+            new Notice(`Failed: ${error.message}`, 5000);
+        }
+    }
+
+    /**
+     * Open the catalog browser for cross-reference research.
+     * User can select videos to cross-reference with the concept.
+     */
+    async openCrossReferenceCatalog(node: any) {
+        let conceptName = '';
+        let conceptContext = '';
+        let sourceFile: TFile | null = null;
+
+        if (node.file) {
+            sourceFile = node.file;
+            conceptName = sourceFile.basename;
+
+            // Try to get context from frontmatter
+            const cache = this.app.metadataCache.getFileCache(sourceFile);
+            if (cache?.frontmatter?.cluster) {
+                conceptContext = `Part of ${cache.frontmatter.cluster}`;
+            }
+        } else if (node.text) {
+            const text = node.text;
+            const match = text.match(/\*\*([^*]+)\*\*/) || text.match(/^#*\s*(.+)$/m);
+            conceptName = match ? match[1].trim() : text.substring(0, 50).trim();
+        } else if (node.label) {
+            conceptName = node.label;
+        }
+
+        if (!conceptName) {
+            new Notice('Could not get concept name from node');
+            return;
+        }
+
+        new Notice(`Opening catalog for "${conceptName}"...`, 2000);
+
+        const modal = new CatalogBrowserModal(
+            this.app,
+            this,
+            conceptName,
+            conceptContext,
+            sourceFile || { path: this.settings.syncFolder, parent: null, basename: conceptName } as any
+        );
+        modal.open();
+    }
+
+    /**
+     * Open RLM Enrichment for a checkpoint.
+     * Parses the checkpoint file, lets user select videos, enriches with new knowledge.
+     */
+    async openEnrichCheckpoint(node: any) {
+        if (!node.file) {
+            new Notice('Checkpoint file not found');
+            return;
+        }
+
+        const sourceFile = node.file as TFile;
+        const cache = this.app.metadataCache.getFileCache(sourceFile);
+
+        if (!cache?.frontmatter || cache.frontmatter.type !== 'checkpoint') {
+            new Notice('This is not a checkpoint file');
+            return;
+        }
+
+        // Parse checkpoint data from file
+        const content = await this.app.vault.read(sourceFile);
+
+        // Extract current invariables
+        const invariablesMatch = content.match(/## INVARIABLES[\s\S]*?\|[\s\S]*?\|([\s\S]*?)(?=\n---|\n##|$)/);
+        const currentInvariables: string[] = [];
+        if (invariablesMatch) {
+            const links = invariablesMatch[1].match(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g) || [];
+            for (const link of links) {
+                const nameMatch = link.match(/\[\[(?:[^\]|]+\|)?([^\]]+)\]\]/);
+                if (nameMatch && nameMatch[1] !== 'none') {
+                    currentInvariables.push(nameMatch[1].trim());
+                }
+            }
+        }
+
+        // Extract current variables
+        const variablesMatch = content.match(/## VARIABLES[\s\S]*?((?:- \*\*IF.*\n?)+)/);
+        const currentVariables: string[] = [];
+        if (variablesMatch) {
+            const lines = variablesMatch[1].match(/- \*\*IF[^*]+\*\*[^\n]+/g) || [];
+            currentVariables.push(...lines.map(l => l.replace(/^- /, '').trim()));
+        }
+
+        // Extract goal
+        const goalMatch = content.match(/## Goal\n\n([^\n]+)/);
+        const goal = goalMatch ? goalMatch[1].trim() : '';
+
+        // Extract success test
+        const successMatch = content.match(/## Success Test\n\n> ([^\n]+)/);
+        const successTest = successMatch ? successMatch[1].trim() : '';
+
+        new Notice(`Opening enrichment for "${sourceFile.basename}"...`, 2000);
+
+        const modal = new EnrichCheckpointModal(
+            this.app,
+            this,
+            {
+                name: sourceFile.basename,
+                cluster: cache.frontmatter.cluster || '',
+                currentInvariables,
+                currentVariables,
+                goal,
+                successTest
+            },
+            sourceFile
+        );
+        modal.open();
+    }
+
+    /**
+     * RLM Pipeline - Single button for: Backup → Enrich → Rebuild Canvas
+     */
+    async runRLMPipeline(canvasView: ItemView) {
+        try {
+            const canvas = (canvasView as any).canvas;
+            if (!canvas) {
+                new Notice('Could not access canvas');
+                return;
+            }
+
+            // Get canvas file
+            const canvasFile = (canvasView as any).file as TFile;
+            if (!canvasFile) {
+                new Notice('Could not determine canvas file');
+                return;
+            }
+
+            const parentFolder = canvasFile.parent;
+            if (!parentFolder) {
+                new Notice('Could not determine folder');
+                return;
+            }
+
+            // Check for subfolder with same name as canvas (common pattern)
+            // e.g., "Knee Shield Pass.canvas" → look in "Knee Shield Pass/" subfolder
+            const canvasBasename = canvasFile.basename;
+            const subfolderPath = `${parentFolder.path}/${canvasBasename}`;
+            const subfolder = this.app.vault.getAbstractFileByPath(subfolderPath);
+
+            // Use subfolder if it exists, otherwise use parent folder
+            const targetFolderPath = (subfolder && subfolder instanceof TFolder)
+                ? subfolderPath
+                : parentFolder.path;
+
+            console.log('Canvas:', canvasFile.path);
+            console.log('Looking for checkpoints in:', targetFolderPath);
+
+            // Find all checkpoint files in the target folder
+            const checkpointFiles: TFile[] = [];
+
+            for (const file of this.app.vault.getFiles()) {
+                // Must be markdown in target folder
+                if (file.extension !== 'md') continue;
+                if (file.parent?.path !== targetFolderPath) continue;
+
+                const cache = this.app.metadataCache.getFileCache(file);
+                const frontmatter = cache?.frontmatter;
+
+                if (frontmatter?.type === 'checkpoint') {
+                    checkpointFiles.push(file);
+                    console.log('Found checkpoint:', file.basename);
+                }
+            }
+
+            // Sort by order in frontmatter or filename
+            checkpointFiles.sort((a, b) => {
+                const cacheA = this.app.metadataCache.getFileCache(a);
+                const cacheB = this.app.metadataCache.getFileCache(b);
+                const orderA = cacheA?.frontmatter?.order || parseInt(a.basename.match(/\[(\d+)\]/)?.[1] || '99');
+                const orderB = cacheB?.frontmatter?.order || parseInt(b.basename.match(/\[(\d+)\]/)?.[1] || '99');
+                return orderA - orderB;
+            });
+
+            console.log('Found checkpoints:', checkpointFiles.map(f => f.basename));
+
+            if (checkpointFiles.length === 0) {
+                new Notice(`No checkpoint files found in ${targetFolderPath}. Files need frontmatter: type: checkpoint`);
+                return;
+            }
+
+            // Get the actual folder object for the target path
+            const targetFolder = this.app.vault.getAbstractFileByPath(targetFolderPath) as TFolder;
+
+            // Open the unified RLM Pipeline modal
+            const modal = new RLMPipelineModal(
+                this.app,
+                this,
+                canvasFile,
+                targetFolder,
+                checkpointFiles
+            );
+            modal.open();
+
+        } catch (error: any) {
+            new Notice(`Error: ${error.message}`);
+            console.error('RLM Pipeline error:', error);
+        }
+    }
+
+    /**
+     * Rebuild Canvas from checkpoint files - proper layout with all connections.
+     * This regenerates the entire canvas from the enriched markdown files.
+     */
+    async rebuildCanvasFromCheckpoints() {
+        // Get active file to determine folder
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+            new Notice('Open a file in the checkpoint folder first');
+            return;
+        }
+
+        const folder = activeFile.parent;
+        if (!folder) {
+            new Notice('Could not determine folder');
+            return;
+        }
+
+        new Notice(`Scanning ${folder.path} for checkpoints...`);
+
+        try {
+            // Find all checkpoint files in the folder
+            const checkpoints: any[] = [];
+            const methods: any[] = [];
+
+            for (const file of this.app.vault.getFiles()) {
+                if (!file.path.startsWith(folder.path) || file.extension !== 'md') continue;
+
+                const cache = this.app.metadataCache.getFileCache(file);
+                if (!cache?.frontmatter) continue;
+
+                const type = cache.frontmatter.type;
+
+                if (type === 'checkpoint') {
+                    const content = await this.app.vault.read(file);
+
+                    // Parse order from frontmatter or filename
+                    const order = cache.frontmatter.order || parseInt(file.basename.match(/^\[?(\d+)/)?.[1] || '99');
+
+                    // Extract linked invariables
+                    const invariables: string[] = [];
+                    const invMatch = content.match(/## INVARIABLES[\s\S]*?\|([\s\S]*?)(?=\n##|\n---)/);
+                    if (invMatch) {
+                        const links = invMatch[1].match(/\[\[([^\]|]+)/g) || [];
+                        for (const link of links) {
+                            const name = link.replace('[[', '').trim();
+                            if (name && name !== 'none') {
+                                invariables.push(name);
+                            }
+                        }
+                    }
+
+                    // Extract navigation links
+                    const navigation: string[] = [];
+                    const navMatch = content.match(/## Navigation[\s\S]*?((?:\[\[[^\]]+\]\][^\n]*\n?)+)/);
+                    if (navMatch) {
+                        const navLinks = navMatch[1].match(/\[\[([^\]|]+)/g) || [];
+                        for (const link of navLinks) {
+                            navigation.push(link.replace('[[', '').trim());
+                        }
+                    }
+
+                    checkpoints.push({
+                        file,
+                        order,
+                        cluster: cache.frontmatter.cluster || '',
+                        invariables,
+                        navigation
+                    });
+                } else if (type === 'method' || type === 'concept') {
+                    methods.push({
+                        file,
+                        tier: cache.frontmatter.tier || 'REFINEMENT',
+                        cluster: cache.frontmatter.cluster || ''
+                    });
+                }
+            }
+
+            if (checkpoints.length === 0) {
+                new Notice('No checkpoint files found in this folder');
+                return;
+            }
+
+            // Sort checkpoints by order
+            checkpoints.sort((a, b) => a.order - b.order);
+
+            new Notice(`Found ${checkpoints.length} checkpoints, ${methods.length} methods. Building canvas...`);
+
+            // Build canvas JSON
+            const canvasData: any = {
+                nodes: [],
+                edges: []
+            };
+
+            // Layout constants
+            const checkpointWidth = 300;
+            const checkpointHeight = 150;
+            const methodWidth = 200;
+            const methodHeight = 80;
+            const horizontalGap = 400;
+            const verticalGap = 200;
+            const methodOffsetX = 350;
+            const methodGap = 100;
+
+            // Create checkpoint nodes in a horizontal flow
+            let currentX = 100;
+            const checkpointY = 300;
+            const nodeIdMap: Map<string, string> = new Map();
+
+            for (let i = 0; i < checkpoints.length; i++) {
+                const cp = checkpoints[i];
+                const nodeId = `checkpoint-${i}`;
+                nodeIdMap.set(cp.file.basename, nodeId);
+
+                canvasData.nodes.push({
+                    id: nodeId,
+                    type: 'file',
+                    file: cp.file.path,
+                    x: currentX,
+                    y: checkpointY,
+                    width: checkpointWidth,
+                    height: checkpointHeight,
+                    color: '4' // Blue for checkpoints
+                });
+
+                // Add method nodes for invariables (stacked above)
+                let methodY = checkpointY - methodGap - methodHeight;
+                for (const invName of cp.invariables) {
+                    // Find the method file
+                    const methodFile = methods.find(m => m.file.basename === invName);
+                    if (methodFile) {
+                        const methodId = `method-${nodeIdMap.size}`;
+                        nodeIdMap.set(invName, methodId);
+
+                        canvasData.nodes.push({
+                            id: methodId,
+                            type: 'file',
+                            file: methodFile.file.path,
+                            x: currentX + methodOffsetX,
+                            y: methodY,
+                            width: methodWidth,
+                            height: methodHeight,
+                            color: methodFile.tier === 'CRITICAL' ? '1' : methodFile.tier === 'IMPORTANT' ? '6' : '0'
+                        });
+
+                        // Edge from checkpoint to method
+                        canvasData.edges.push({
+                            id: `edge-${canvasData.edges.length}`,
+                            fromNode: nodeId,
+                            fromSide: 'right',
+                            toNode: methodId,
+                            toSide: 'left'
+                        });
+
+                        methodY -= methodHeight + 30;
+                    }
+                }
+
+                // Edge to next checkpoint
+                if (i < checkpoints.length - 1) {
+                    canvasData.edges.push({
+                        id: `edge-cp-${i}`,
+                        fromNode: nodeId,
+                        fromSide: 'right',
+                        toNode: `checkpoint-${i + 1}`,
+                        toSide: 'left',
+                        color: '5'
+                    });
+                }
+
+                currentX += horizontalGap;
+            }
+
+            // Add navigation edges between checkpoints
+            for (const cp of checkpoints) {
+                const fromId = nodeIdMap.get(cp.file.basename);
+                for (const navTarget of cp.navigation) {
+                    const toId = nodeIdMap.get(navTarget);
+                    if (fromId && toId && fromId !== toId) {
+                        // Check if edge already exists
+                        const exists = canvasData.edges.some((e: any) =>
+                            e.fromNode === fromId && e.toNode === toId
+                        );
+                        if (!exists) {
+                            canvasData.edges.push({
+                                id: `edge-nav-${canvasData.edges.length}`,
+                                fromNode: fromId,
+                                fromSide: 'bottom',
+                                toNode: toId,
+                                toSide: 'top',
+                                color: '3' // Green for navigation
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Save canvas file
+            const canvasPath = `${folder.path}/${folder.name} - Generated.canvas`;
+            const canvasContent = JSON.stringify(canvasData, null, 2);
+
+            const existingCanvas = this.app.vault.getAbstractFileByPath(canvasPath);
+            if (existingCanvas) {
+                await this.app.vault.modify(existingCanvas as TFile, canvasContent);
+            } else {
+                await this.app.vault.create(canvasPath, canvasContent);
+            }
+
+            new Notice(`Canvas created: ${canvasPath}`);
+
+            // Open the canvas
+            const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
+            if (canvasFile) {
+                await this.app.workspace.getLeaf().openFile(canvasFile as TFile);
+            }
+
+        } catch (error: any) {
+            new Notice(`Error: ${error.message}`);
+            console.error('Rebuild canvas error:', error);
+        }
+    }
+
+    /**
+     * Extract WebM clip from a method node - shows clip browser with options.
+     */
+    async extractClipFromMethod(file: TFile, frontmatter: any) {
+        const { video_id, source_instructor } = frontmatter;
+        const conceptName = file.basename;
+
+        if (!video_id) {
+            new Notice('No video_id found - cannot extract clip');
+            return;
+        }
+
+        new Notice(`Finding clip options for "${conceptName}"...`);
+
+        try {
+            // Call API to get clip options from transcription
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/clip-options`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify({
+                    video_id: video_id,
+                    concept: conceptName,
+                    instructor: source_instructor || ''
+                })
+            });
+
+            const data = response.json;
+
+            if (data.error) {
+                new Notice(`Error: ${data.error}`);
+                return;
+            }
+
+            // Open clip browser modal
+            const modal = new ClipBrowserModal(
+                this.app,
+                this,
+                file,
+                data
+            );
+            modal.open();
+
+        } catch (error: any) {
+            new Notice(`Error finding clips: ${error.message}`);
+            console.error('Clip options error:', error);
+        }
+    }
+
+    /**
+     * Actually extract a WebM clip after user selects it.
+     */
+    async doExtractClip(videoId: string, startTime: number, duration: number, outputName: string): Promise<string | null> {
+        try {
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/extract-clip`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify({
+                    video_id: videoId,
+                    start_time: startTime,
+                    duration: duration,
+                    output_name: outputName
+                })
+            });
+
+            const data = response.json;
+            if (data.clip_path) {
+                return data.clip_path;
+            }
+            return null;
+        } catch (error) {
+            console.error('Extract clip error:', error);
+            return null;
+        }
+    }
+
+    /**
+     * Find video for selected Canvas node.
+     * Shows concept cache with clickable timestamps.
+     */
+    async findVideoForCanvasNode(canvasView: ItemView) {
+        try {
+            // Access the canvas through the view
+            const canvas = (canvasView as any).canvas;
+            if (!canvas) {
+                new Notice('Could not access canvas');
+                return;
+            }
+
+            // Get selected nodes
+            const selection = canvas.selection;
+            if (!selection || selection.size === 0) {
+                new Notice('Select a concept node in the canvas first');
+                return;
+            }
+
+            // Get the first selected node
+            const selectedNode = Array.from(selection)[0] as any;
+
+            // Get concept name from node
+            let conceptName = '';
+            let sourceFile: TFile | null = null;
+
+            if (selectedNode.file) {
+                // File node - get the linked file
+                sourceFile = selectedNode.file;
+                conceptName = sourceFile.basename;
+            } else if (selectedNode.text) {
+                // Text node - extract concept from text
+                const text = selectedNode.text;
+                // Try to extract a concept name (first line or bold text)
+                const match = text.match(/\*\*([^*]+)\*\*/) || text.match(/^#*\s*(.+)$/m);
+                conceptName = match ? match[1].trim() : text.substring(0, 50).trim();
+            } else {
+                new Notice('Select a concept node (file or text node)');
+                return;
+            }
+
+            if (!conceptName) {
+                new Notice('Could not determine concept name from node');
+                return;
+            }
+
+            new Notice(`Finding video for "${conceptName}"...`, 3000);
+
+            // Call the explore-video API
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/explore-video`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify({
+                    concept: conceptName
+                })
+            });
+
+            const data = response.json;
+
+            if (data.error) {
+                new Notice(`No video found for "${conceptName}"`, 3000);
+                return;
+            }
+
+            // Create a temporary file reference for the modal
+            const tempFile = sourceFile || this.app.vault.getAbstractFileByPath(
+                `${this.settings.syncFolder}/temp-concept.md`
+            ) as TFile;
+
+            // Open the Video Explorer modal
+            const modal = new VideoExplorerModal(
+                this.app,
+                this,
+                data,
+                tempFile || { path: this.settings.syncFolder, parent: null, basename: conceptName } as any
+            );
+            modal.open();
+
+        } catch (error: any) {
+            console.error('Canvas video finder error:', error);
+            new Notice(`Failed to find video: ${error.message}`, 5000);
+        }
+    }
+
+    /**
+     * Series Explorer: Show all volumes in a video series with clickable timestamps.
+     */
+    async exploreSeriesForConcept(file: TFile) {
+        const content = await this.app.vault.read(file);
+        const conceptName = file.basename;
+
+        new Notice(`Searching for video series about "${conceptName}"...`, 3000);
+
+        try {
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/explore-series`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify({
+                    concept: conceptName
+                })
+            });
+
+            const data = response.json;
+
+            if (data.error) {
+                new Notice(`No video series found for "${conceptName}"`, 3000);
+                return;
+            }
+
+            new Notice(`Found ${data.total_volumes} volumes in "${data.series_name}"!`, 3000);
+
+            // Open the Series Explorer modal
+            const modal = new SeriesExplorerModal(
+                this.app,
+                this,
+                data,
+                file
+            );
+            modal.open();
+
+        } catch (error: any) {
+            console.error('Series explorer error:', error);
+            new Notice(`Failed to explore series: ${error.message}`, 5000);
+        }
+    }
+
+    /**
+     * Generate a clip on-demand and save to vault.
+     */
+    async generateClipOnDemand(videoId: string, timestampSeconds: number, targetFolder: string): Promise<string | null> {
+        try {
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/generate-clip-on-demand`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                },
+                body: JSON.stringify({
+                    video_id: videoId,
+                    timestamp_seconds: timestampSeconds,
+                    duration: 60
+                })
+            });
+
+            const clipData = response.json;
+            if (!clipData.clip_url) {
+                return null;
+            }
+
+            // Download the clip
+            const clipResponse = await requestUrl({
+                url: `${this.settings.serverUrl}${clipData.clip_url}`,
+                method: 'GET'
+            });
+
+            // Save to vault
+            const clipFilename = `${videoId}_${timestampSeconds}s.webm`;
+            const clipPath = `${targetFolder}/${clipFilename}`;
+            await this.ensureFolder(targetFolder);
+            await this.app.vault.adapter.writeBinary(clipPath, clipResponse.arrayBuffer);
+
+            return clipPath;
+
+        } catch (error) {
+            console.error('Clip generation error:', error);
+            return null;
+        }
     }
 
     async coachShowPending() {
@@ -937,8 +2596,8 @@ ${job.query_text}
             return;
         }
 
-        // Read all concept files from Concepts folder
-        const conceptsFolder = `${this.settings.syncFolder}/Concepts`;
+        // Read all concept files from concepts folder
+        const conceptsFolder = `${this.settings.syncFolder}/${this.settings.conceptsSubfolder}`;
         const conceptFiles = this.app.vault.getMarkdownFiles().filter(f =>
             f.path.startsWith(conceptsFolder) && !f.basename.startsWith('_')
         );
@@ -1104,11 +2763,11 @@ ${job.query_text}
             // Create pending note in vault
             await this.createPendingJobNote(jobId, query);
 
-            new Notice('Query sent to coach! You\'ll be notified when ready.');
+            new Notice('Query sent to Oracle! You\'ll be notified when ready.');
             return jobId;
         } catch (error) {
             console.error('Failed to submit query:', error);
-            new Notice('Failed to send query to coach. Check your connection.');
+            new Notice('Failed to send query to Oracle. Check your connection.');
             return null;
         }
     }
@@ -1141,7 +2800,7 @@ status: pending
 
 ---
 
-*Waiting for coach to process...*
+*Waiting for Oracle to process...*
 
 This note will be updated when results are ready.
 `;
@@ -1278,18 +2937,18 @@ This note will be updated when results are ready.
                 const msg = [];
                 if (synced > 0) msg.push(`${synced} research article(s)`);
                 if (conceptsSynced > 0) msg.push(`${conceptsSynced} concept(s)`);
-                new Notice(`Synced ${msg.join(' and ')} from coach!`);
+                new Notice(`Synced ${msg.join(' and ')} from Oracle!`);
             } else {
                 new Notice('All research already synced');
             }
         } catch (error) {
             console.error('[Flipmode] Sync error:', error);
-            new Notice('Failed to sync from coach');
+            new Notice('Failed to sync from Oracle');
         }
     }
 
     async syncConceptsToVault(concepts: any[]): Promise<number> {
-        const folder = `${this.settings.syncFolder}/Concepts`;
+        const folder = `${this.settings.syncFolder}/${this.settings.conceptsSubfolder}`;
         await this.ensureFolder(folder);
 
         let created = 0;
@@ -1311,7 +2970,7 @@ This note will be updated when results are ready.
             const content = `---
 type: concept
 parent: "${concept.parent || ''}"
-tags: [concept, bjj, ${concept.category?.toLowerCase() || 'technique'}]
+tags: [concept, grappling, ${concept.category?.toLowerCase() || 'technique'}]
 ---
 
 # ${concept.name}
@@ -1371,12 +3030,12 @@ ${relatedLinks}
         const filename = `${folder}/${date} - ${shortQuery}.md`;
 
         const content = `---
-type: coach-research
+type: oracle-research
 job_id: ${job.job_id}
 query: "${job.enriched_query || job.query_text}"
 received: ${new Date().toISOString()}
 rlm_session_id: ${result.rlm_session_id || ''}
-tags: [bjj, research, from-coach]
+tags: [bjj, research, from-oracle]
 ---
 
 # Research: ${shortQuery}
@@ -1384,7 +3043,7 @@ tags: [bjj, research, from-coach]
 ${result.article}
 
 ---
-*Research provided by your coach*
+*Research provided by Oracle*
 `;
 
         await this.app.vault.create(filename, content);
@@ -2152,203 +3811,421 @@ ${deepDiveContent}
                 return;
             }
 
-            const concepts = result.concepts || [];
-            if (concepts.length === 0) {
-                new Notice('No concepts extracted');
+            // Structure: checkpoints with invariables (tiered) and variables (IF/THEN)
+            const checkpoints = result.checkpoints || [];
+            if (checkpoints.length === 0) {
+                new Notice('No checkpoints extracted');
                 return;
             }
 
-            // Create Concepts folder
-            const conceptsFolder = `${this.settings.syncFolder}/Concepts`;
+            const topicName = result.topic_name || file.basename;
+            const topicTags: string[] = result.topic_tags || [];
+            const clusterName = topicName.replace(/[^\w\s-]/g, '').trim();
+            const conceptsBase = `${this.settings.syncFolder}/${this.settings.conceptsSubfolder}`;
+            const conceptsFolder = `${conceptsBase}/${clusterName}`;
             await this.ensureFolder(conceptsFolder);
 
-            // Create a note for each concept
-            let createdCount = 0;
-            for (const concept of concepts) {
-                const conceptName = concept.name.replace(/[^\w\s-]/g, '').trim();
-                const conceptPath = `${conceptsFolder}/${conceptName}.md`;
+            const normalizeName = (name: string) => {
+                if (!name) return '';
+                let clean = name.replace(/[^\w\s-]/g, '').trim();
+                clean = clean.replace(/^(The|A|An)\s+/i, '');
+                return clean;
+            };
 
-                // Check if concept already exists
-                const existing = this.app.vault.getAbstractFileByPath(conceptPath);
-                if (existing) {
-                    // TODO: Could merge/update existing concept
+            const topicTagsStr = topicTags.length > 0
+                ? topicTags.map((t: string) => t.toLowerCase().replace(/\s+/g, '-')).join(', ')
+                : '';
+
+            let createdCount = 0;
+            const createdNames = new Set<string>();
+            checkpoints.sort((a: any, b: any) => (a.order || 1) - (b.order || 1));
+
+            // Create CHECKPOINT notes (link sequentially)
+            for (let i = 0; i < checkpoints.length; i++) {
+                const cp = checkpoints[i];
+                const cpName = normalizeName(cp.name);
+                if (!cpName || createdNames.has(cpName.toLowerCase())) continue;
+
+                const cpPath = `${conceptsFolder}/${cpName}.md`;
+                if (this.app.vault.getAbstractFileByPath(cpPath)) {
+                    createdNames.add(cpName.toLowerCase());
                     continue;
                 }
 
-                // Build linked markdown
-                const parentLink = concept.parent ? `[[${concept.parent}]]` : 'Root concept';
-                const prereqLinks = (concept.prerequisites || []).map((p: string) => `- [[${p}]]`).join('\n') || '- None';
-                const leadsToLinks = (concept.leads_to || []).map((l: string) => `- [[${l}]]`).join('\n') || '- None';
-                const counterLinks = (concept.counters || []).map((c: string) => `- [[${c}]]`).join('\n') || '- None';
-                const relatedLinks = (concept.related || []).map((r: string) => `- [[${r}]]`).join('\n') || '- None';
+                const order = cp.order || (i + 1);
+                const prevCp = i > 0 ? normalizeName(checkpoints[i - 1].name) : null;
+                const nextCp = i < checkpoints.length - 1 ? normalizeName(checkpoints[i + 1].name) : null;
 
-                // Build hierarchical tags based on tier
-                const tier = concept.tier || 'tier3';
-                const tierTag = tier === 'title' ? 'priority/title' : `priority/${tier}`;
+                // Build invariables by tier
+                const invariables = cp.invariables || [];
+                const tier1 = invariables.filter((inv: any) => inv.tier === 'tier1');
+                const tier2 = invariables.filter((inv: any) => inv.tier === 'tier2');
+                const tier3 = invariables.filter((inv: any) => inv.tier === 'tier3' || !inv.tier);
 
-                const conceptContent = `---
-type: concept
-tier: "${tier}"
-parent: "${concept.parent || ''}"
-tags: [concept, bjj, ${concept.category?.toLowerCase() || 'technique'}, ${tierTag}]
+                const formatTierLinks = (items: any[]) => items.length > 0
+                    ? items.map((inv: any) => `[[${clusterName}/${normalizeName(inv.name)}|${normalizeName(inv.name)}]]`).join(' · ')
+                    : '*none*';
+
+                // Build variables
+                const variables = cp.variables || [];
+                const varLinks = variables.length > 0
+                    ? variables.map((v: any) => `- **${v.trigger}** → [[${clusterName}/${normalizeName(v.name)}|${normalizeName(v.name)}]]`).join('\n')
+                    : '*No situational responses*';
+
+                const content = `---
+type: checkpoint
+order: ${order}
+cluster: "${clusterName}"
+tags: [grappling, checkpoint${topicTagsStr ? ', ' + topicTagsStr : ''}]
 source_file: "${file.basename}"
 source_rlm_session: "${sourceRlmSessionId}"
 ---
 
-# ${concept.name}
+# [${order}] ${cpName}
 
-**Category:** ${concept.category || 'Technique'}  |  **Priority:** ${tier === 'title' ? '🎯 Title Concept' : tier === 'tier1' ? '🔴 Tier 1 - Critical' : tier === 'tier2' ? '🟡 Tier 2 - Important' : '🟢 Tier 3 - Supporting'}
-**Parent:** ${parentLink}
+> [!success] CHECKPOINT ${order} of ${checkpoints.length}
 
-## Summary
+## Goal
 
-${concept.summary || 'No summary available.'}
+${cp.goal || 'No goal defined.'}
 
-## Prerequisites
+## Success Test
 
-${prereqLinks}
+> ${cp.success_test || 'No test defined.'}
 
-## Leads To
+---
 
-${leadsToLinks}
+## INVARIABLES (Always Do Together)
 
-## Counters
+| Tier | Concepts |
+|------|----------|
+| CRITICAL | ${formatTierLinks(tier1)} |
+| IMPORTANT | ${formatTierLinks(tier2)} |
+| REFINEMENT | ${formatTierLinks(tier3)} |
 
-${counterLinks}
+---
 
-## Related Concepts
+## VARIABLES (IF/THEN)
 
-${relatedLinks}
+${varLinks}
+
+---
+
+## Navigation
+
+| Previous | Next |
+|----------|------|
+| ${prevCp ? `[[${clusterName}/${prevCp}|< ${prevCp}]]` : '*Start*'} | ${nextCp ? `[[${clusterName}/${nextCp}|${nextCp} >]]` : '*End*'} |
 `;
 
-                await this.app.vault.create(conceptPath, conceptContent);
+                await this.app.vault.create(cpPath, content);
+                createdNames.add(cpName.toLowerCase());
                 createdCount++;
             }
 
-            // Create stub files for all linked concepts that don't exist yet
-            // Track detailed relationship context for each linked concept
-            interface LinkedContext {
-                isPrerequisiteFor: string[];
-                leadsTo: string[];
-                counters: string[];
-                counteredBy: string[];
-                relatedTo: string[];
-                parentOf: string[];
-                childOf: string[];
-            }
-            const linkedConceptContext: Map<string, LinkedContext> = new Map();
+            // Create INVARIABLE notes
+            for (const cp of checkpoints) {
+                const cpName = normalizeName(cp.name);
+                const order = cp.order || 1;
 
-            const getContext = (name: string): LinkedContext => {
-                if (!linkedConceptContext.has(name)) {
-                    linkedConceptContext.set(name, {
-                        isPrerequisiteFor: [], leadsTo: [], counters: [],
-                        counteredBy: [], relatedTo: [], parentOf: [], childOf: []
-                    });
-                }
-                return linkedConceptContext.get(name)!;
-            };
+                for (const inv of (cp.invariables || [])) {
+                    const invName = normalizeName(inv.name);
+                    if (!invName || createdNames.has(invName.toLowerCase())) continue;
 
-            for (const concept of concepts) {
-                // Parent relationship
-                if (concept.parent) {
-                    getContext(concept.parent).parentOf.push(concept.name);
-                }
-                // Prerequisites - the prereq enables this concept
-                for (const p of concept.prerequisites || []) {
-                    getContext(p).leadsTo.push(concept.name);
-                    getContext(p).isPrerequisiteFor.push(concept.name);
-                }
-                // Leads to - this concept enables those
-                for (const l of concept.leads_to || []) {
-                    getContext(l).childOf.push(concept.name);
-                }
-                // Counters - bidirectional
-                for (const c of concept.counters || []) {
-                    getContext(c).counteredBy.push(concept.name);
-                }
-                // Related
-                for (const r of concept.related || []) {
-                    getContext(r).relatedTo.push(concept.name);
-                }
-            }
+                    const invPath = `${conceptsFolder}/${invName}.md`;
+                    if (this.app.vault.getAbstractFileByPath(invPath)) {
+                        createdNames.add(invName.toLowerCase());
+                        continue;
+                    }
 
-            // Remove concepts we already created
-            for (const concept of concepts) {
-                linkedConceptContext.delete(concept.name);
-            }
+                    const tier = inv.tier || 'tier3';
+                    const tierLabel = tier === 'tier1' ? 'CRITICAL' : tier === 'tier2' ? 'IMPORTANT' : 'REFINEMENT';
 
-            // Create stubs for remaining linked concepts with full context
-            let stubCount = 0;
-            for (const [linkedName, ctx] of linkedConceptContext) {
-                const safeName = linkedName.replace(/[^\w\s-]/g, '').trim();
-                const stubPath = `${conceptsFolder}/${safeName}.md`;
+                    // Siblings at same checkpoint
+                    const siblings = (cp.invariables || [])
+                        .filter((i: any) => normalizeName(i.name).toLowerCase() !== invName.toLowerCase())
+                        .map((i: any) => `[[${clusterName}/${normalizeName(i.name)}|${normalizeName(i.name)}]]`)
+                        .join(' · ');
 
-                // Skip if already exists
-                if (this.app.vault.getAbstractFileByPath(stubPath)) continue;
-
-                // Build sections with actual content
-                // Build sections - only include what we actually know from the graph
-                const prerequisitesSection = ctx.isPrerequisiteFor.length > 0
-                    ? ctx.isPrerequisiteFor.map(c => `- [[${c}]]`).join('\n')
-                    : '- *Not yet documented - research via Oracle*';
-
-                const leadsToSection = ctx.leadsTo.length > 0
-                    ? ctx.leadsTo.map(c => `- [[${c}]]`).join('\n')
-                    : '- *Not yet documented - research via Oracle*';
-
-                const countersSection = ctx.counteredBy.length > 0
-                    ? ctx.counteredBy.map(c => `- [[${c}]]`).join('\n')
-                    : '- *Not yet documented - research via Oracle*';
-
-                const relatedSection = [
-                    ...ctx.relatedTo.map(c => `- [[${c}]]`),
-                    ...ctx.parentOf.map(c => `- [[${c}]]`),
-                    ...ctx.childOf.map(c => `- [[${c}]]`)
-                ].join('\n') || '- *Not yet documented*';
-
-                const stubContent = `---
-type: concept
-tier: "stub"
-tags: [concept, bjj, stub, priority/tier3]
+                    const content = `---
+type: invariable
+tier: "${tier}"
+checkpoint: "${cpName}"
+checkpoint_order: ${order}
+cluster: "${clusterName}"
+tags: [grappling, invariable, ${tier}${topicTagsStr ? ', ' + topicTagsStr : ''}]
 source_file: "${file.basename}"
 source_rlm_session: "${sourceRlmSessionId}"
 ---
 
-# ${linkedName}
+# ${invName}
 
-> [!info] Research This Concept
-> Use Oracle to research "${linkedName}" and expand this node with real content from your video library.
+> [!${tier === 'tier1' ? 'danger' : tier === 'tier2' ? 'warning' : 'info'}] ${tierLabel} INVARIABLE
+> Part of [[${clusterName}/${cpName}|Checkpoint ${order}: ${cpName}]]
 
-## Summary
+## WHY
 
-*Research this concept via Oracle to add summary from your instructional content.*
+> ${inv.why || 'See parent article.'}
 
-## Prerequisites
+## HOW
 
-${prerequisitesSection}
+${inv.how || 'No explanation.'}
 
-## Leads To
+## FEEL
 
-${leadsToSection}
+> ${inv.feel || 'No feel description.'}
 
-## Counters
+---
 
-${countersSection}
+## Do Together With
 
-## Related Concepts
+${siblings || '*Only invariable at this checkpoint*'}
 
-${relatedSection}
+## Parent
 
-## Training Drills
-
-*Right-click → "Get Training Drills" to search your video library for exercises.*
+[[${clusterName}/${cpName}|< ${cpName}]]
 `;
-                await this.app.vault.create(stubPath, stubContent);
-                stubCount++;
+
+                    await this.app.vault.create(invPath, content);
+                    createdNames.add(invName.toLowerCase());
+                    createdCount++;
+                }
             }
 
-            const totalCreated = createdCount + stubCount;
-            new Notice(`Created ${createdCount} concepts + ${stubCount} linked stubs! Open Graph View.`, 5000);
+            // Create VARIABLE notes
+            for (const cp of checkpoints) {
+                const cpName = normalizeName(cp.name);
+                const order = cp.order || 1;
+
+                for (const v of (cp.variables || [])) {
+                    const vName = normalizeName(v.name);
+                    if (!vName || createdNames.has(vName.toLowerCase())) continue;
+
+                    const vPath = `${conceptsFolder}/${vName}.md`;
+                    if (this.app.vault.getAbstractFileByPath(vPath)) {
+                        createdNames.add(vName.toLowerCase());
+                        continue;
+                    }
+
+                    const content = `---
+type: variable
+trigger: "${v.trigger || ''}"
+checkpoint: "${cpName}"
+checkpoint_order: ${order}
+cluster: "${clusterName}"
+tags: [grappling, variable${topicTagsStr ? ', ' + topicTagsStr : ''}]
+source_file: "${file.basename}"
+source_rlm_session: "${sourceRlmSessionId}"
+---
+
+# ${vName}
+
+> [!warning] VARIABLE - Situational Response
+> Part of [[${clusterName}/${cpName}|Checkpoint ${order}: ${cpName}]]
+
+## TRIGGER
+
+> **${v.trigger || 'When opponent reacts'}**
+
+## ACTION
+
+${v.action || 'No action described.'}
+
+## WHY This Works
+
+> ${v.why || 'See parent article.'}
+
+---
+
+## Parent
+
+[[${clusterName}/${cpName}|< ${cpName}]]
+`;
+
+                    await this.app.vault.create(vPath, content);
+                    createdNames.add(vName.toLowerCase());
+                    createdCount++;
+                }
+            }
+
+            // Create index
+            const clusterTag = `cluster/${clusterName.toLowerCase().replace(/\s+/g, '-')}`;
+            const indexPath = `${conceptsBase}/${clusterName}.md`;
+
+            const cpList = checkpoints.map((cp: any) => {
+                const cpName = normalizeName(cp.name);
+                const invCount = (cp.invariables || []).length;
+                const varCount = (cp.variables || []).length;
+                return `${cp.order || 1}. [[${clusterName}/${cpName}|${cpName}]] (${invCount} inv, ${varCount} var)`;
+            }).join('\n');
+
+            const totalInv = checkpoints.reduce((sum: number, cp: any) => sum + (cp.invariables || []).length, 0);
+            const totalVar = checkpoints.reduce((sum: number, cp: any) => sum + (cp.variables || []).length, 0);
+
+            // Build Mermaid flowchart
+            let mermaidFlow = 'flowchart LR\n';
+            for (let i = 0; i < checkpoints.length; i++) {
+                const cp = checkpoints[i];
+                const cpId = `CP${i + 1}`;
+                const cpName = normalizeName(cp.name).replace(/"/g, '');
+                mermaidFlow += `    ${cpId}["[${i + 1}] ${cpName}"]\n`;
+            }
+            for (let i = 0; i < checkpoints.length - 1; i++) {
+                mermaidFlow += `    CP${i + 1} --> CP${i + 2}\n`;
+            }
+
+            const indexContent = `---
+type: sequence
+cluster: "${clusterName}"
+tags: [cluster, grappling, sequence, ${clusterTag}]
+source_file: "${file.basename}"
+checkpoints_count: ${checkpoints.length}
+invariables_count: ${totalInv}
+variables_count: ${totalVar}
+---
+
+# ${clusterName}
+
+> [!tip] Sequential Checkpoints with Invariables and Variables
+
+**Source:** [[${file.basename}]]
+**Checkpoints:** ${checkpoints.length} | **Invariables:** ${totalInv} | **Variables:** ${totalVar}
+
+---
+
+## Flow Diagram
+
+\`\`\`mermaid
+${mermaidFlow}\`\`\`
+
+---
+
+## The Sequence
+
+${cpList}
+
+---
+
+## How It Works
+
+1. **Checkpoints** = Sequential milestones (complete 1 before 2)
+2. **Invariables** = Always do (tiered by priority, do together)
+3. **Variables** = IF/THEN responses at each checkpoint
+`;
+
+            if (!this.app.vault.getAbstractFileByPath(indexPath)) {
+                await this.app.vault.create(indexPath, indexContent);
+            }
+
+            // Create Canvas file for visual timeline
+            const canvasPath = `${conceptsBase}/${clusterName}.canvas`;
+            if (!this.app.vault.getAbstractFileByPath(canvasPath)) {
+                const nodes: any[] = [];
+                const edges: any[] = [];
+                let nodeId = 1;
+
+                // Layout constants
+                const cpWidth = 280;
+                const cpHeight = 80;
+                const conceptWidth = 220;
+                const conceptHeight = 60;
+                const cpSpacing = 350;
+                const verticalGap = 100;
+
+                // Create checkpoint nodes (horizontal line)
+                const cpNodeIds: string[] = [];
+                for (let i = 0; i < checkpoints.length; i++) {
+                    const cp = checkpoints[i];
+                    const cpName = normalizeName(cp.name);
+                    const cpId = `cp-${nodeId++}`;
+                    cpNodeIds.push(cpId);
+
+                    nodes.push({
+                        id: cpId,
+                        type: 'file',
+                        file: `${conceptsFolder}/${cpName}.md`,
+                        x: i * cpSpacing,
+                        y: 0,
+                        width: cpWidth,
+                        height: cpHeight,
+                        color: '6'
+                    });
+
+                    // Create invariable nodes below checkpoint
+                    const invariables = cp.invariables || [];
+                    for (let j = 0; j < invariables.length; j++) {
+                        const inv = invariables[j];
+                        const invName = normalizeName(inv.name);
+                        const invId = `inv-${nodeId++}`;
+                        const tier = inv.tier || 'tier3';
+                        const color = tier === 'tier1' ? '1' : tier === 'tier2' ? '3' : '4';
+
+                        nodes.push({
+                            id: invId,
+                            type: 'file',
+                            file: `${conceptsFolder}/${invName}.md`,
+                            x: i * cpSpacing + (j * 120) - ((invariables.length - 1) * 60),
+                            y: cpHeight + verticalGap,
+                            width: conceptWidth,
+                            height: conceptHeight,
+                            color: color
+                        });
+
+                        // Edge from checkpoint to invariable
+                        edges.push({
+                            id: `edge-${nodeId++}`,
+                            fromNode: cpId,
+                            toNode: invId,
+                            fromSide: 'bottom',
+                            toSide: 'top'
+                        });
+                    }
+
+                    // Create variable nodes below invariables
+                    const variables = cp.variables || [];
+                    for (let k = 0; k < variables.length; k++) {
+                        const v = variables[k];
+                        const vName = normalizeName(v.name);
+                        const vId = `var-${nodeId++}`;
+
+                        nodes.push({
+                            id: vId,
+                            type: 'file',
+                            file: `${conceptsFolder}/${vName}.md`,
+                            x: i * cpSpacing + (k * 120) - ((variables.length - 1) * 60),
+                            y: cpHeight + verticalGap * 2 + conceptHeight,
+                            width: conceptWidth,
+                            height: conceptHeight,
+                            color: '2'
+                        });
+
+                        // Edge from checkpoint to variable
+                        edges.push({
+                            id: `edge-${nodeId++}`,
+                            fromNode: cpId,
+                            toNode: vId,
+                            fromSide: 'bottom',
+                            toSide: 'top'
+                        });
+                    }
+                }
+
+                // Create edges between checkpoints (the timeline)
+                for (let i = 0; i < cpNodeIds.length - 1; i++) {
+                    edges.push({
+                        id: `edge-${nodeId++}`,
+                        fromNode: cpNodeIds[i],
+                        toNode: cpNodeIds[i + 1],
+                        fromSide: 'right',
+                        toSide: 'left'
+                    });
+                }
+
+                const canvasContent = JSON.stringify({ nodes, edges }, null, 2);
+                await this.app.vault.create(canvasPath, canvasContent);
+            }
+
+            new Notice(`Created "${clusterName}": ${checkpoints.length} checkpoints + Canvas timeline!`, 5000);
 
         } catch (error) {
             console.error('Explode to Concept Graph error:', error);
@@ -2456,6 +4333,75 @@ ${drills}
         } catch (error) {
             console.error('Get Training Drills error:', error);
             new Notice('Failed to get training drills. Check console.', 5000);
+        }
+    }
+
+    // Research a concept - dive deeper via Oracle RLM
+    async researchConcept(file: TFile) {
+        const content = await this.app.vault.read(file);
+        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+
+        if (!frontmatterMatch) {
+            new Notice('No frontmatter found');
+            return;
+        }
+
+        const frontmatter = frontmatterMatch[1];
+        const conceptName = file.basename;
+
+        // Get RLM session if available
+        const sessionMatch = frontmatter.match(/source_rlm_session:\s*"([^"]+)"/);
+        const rlmSessionId = sessionMatch ? sessionMatch[1] : '';
+
+        new Notice(`Researching: ${conceptName}...`, 3000);
+
+        try {
+            // Query Oracle for more info about this concept
+            const oracleUrl = 'http://localhost:5002';
+            const response = await requestUrl({
+                url: `${oracleUrl}/api/internal/deep-dive`,
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    session_id: rlmSessionId || `concept_${conceptName}`,
+                    focus_text: `${conceptName}: key details, variations, common mistakes, and important nuances`
+                })
+            });
+
+            const result = response.json;
+
+            if (result.error) {
+                new Notice(`Research failed: ${result.error}`, 5000);
+                return;
+            }
+
+            const research = result.deep_dive_raw || result.deep_dive_html;
+            const sourcesCount = result.new_sources_count || 0;
+
+            if (!research || sourcesCount === 0) {
+                new Notice(`No content found for "${conceptName}" in your library`, 5000);
+                return;
+            }
+
+            // Append research to the concept file
+            const timestamp = new Date().toLocaleTimeString();
+            const researchSection = `
+
+---
+## Research Findings
+*Found ${sourcesCount} sources at ${timestamp}*
+
+${research}
+`;
+
+            const updatedContent = content + researchSection;
+            await this.app.vault.modify(file, updatedContent);
+
+            new Notice(`Added research for: ${conceptName} (${sourcesCount} sources)`, 5000);
+
+        } catch (error) {
+            console.error('Research concept error:', error);
+            new Notice('Research failed. Is Oracle running?', 5000);
         }
     }
 
@@ -2830,6 +4776,99 @@ ${sourceLinkBody}
         } catch (error) {
             console.error('Sync error:', error);
             new Notice('Sync failed - check console for details');
+        }
+    }
+
+    // Sync shared concept from coach and open it (called from Discord link)
+    async syncAndOpenConcept(conceptName: string) {
+        new Notice(`Syncing "${conceptName}" from coach...`);
+
+        try {
+            // In remote mode, fetch from queue service
+            if (this.settings.mode === 'remote' && this.settings.athleteToken) {
+                const response = await requestUrl({
+                    url: `${this.settings.queueServiceUrl}/api/queue/shared-concepts`,
+                    method: 'GET',
+                    headers: { 'Authorization': `Bearer ${this.settings.athleteToken}` }
+                });
+
+                const sharedConcepts = response.json.shared_concepts || [];
+
+                // Find the specific concept
+                const concept = sharedConcepts.find((c: any) =>
+                    c.name === conceptName || c.name.includes(conceptName)
+                );
+
+                if (concept) {
+                    // Save concept files to vault
+                    const conceptsBase = `${this.settings.syncFolder}/${this.settings.conceptsSubfolder}`;
+                    // Ensure base folder exists
+                    await this.ensureFolder(conceptsBase);
+
+                    const data = concept.data || {};
+
+                    if (data.type === 'cluster' && data.clusterName) {
+                        // Create cluster folder and files
+                        const clusterFolder = `${conceptsBase}/${data.clusterName}`;
+                        await this.ensureFolder(clusterFolder);
+
+                        // Save index file
+                        const indexPath = `${conceptsBase}/${data.clusterName}.md`;
+                        if (data.indexContent) {
+                            await this.saveNote(indexPath, data.indexContent);
+                        }
+
+                        // Save concept files
+                        for (const c of data.concepts || []) {
+                            const filePath = `${clusterFolder}/${c.name}.md`;
+                            await this.saveNote(filePath, c.content);
+                        }
+
+                        new Notice(`Synced "${conceptName}" - opening...`);
+                        await this.app.workspace.openLinkText(indexPath, '', true);
+                    } else if (data.type === 'concept' && data.content) {
+                        // Single concept with content
+                        const filePath = `${conceptsBase}/${conceptName}.md`;
+                        await this.saveNote(filePath, data.content);
+                        new Notice(`Synced "${conceptName}" - opening...`);
+                        await this.app.workspace.openLinkText(filePath, '', true);
+                    } else {
+                        // No full data - create stub note with summary
+                        const filePath = `${conceptsBase}/${conceptName}.md`;
+                        const stubContent = `---
+type: shared-concept
+from_oracle: true
+shared_at: "${concept.shared_at || new Date().toISOString()}"
+---
+
+# ${conceptName}
+
+${concept.summary || 'Concept shared from Oracle.'}
+
+---
+*Full content pending - sync with Oracle for details.*
+`;
+                        await this.saveNote(filePath, stubContent);
+                        new Notice(`Synced "${conceptName}" - opening...`);
+                        await this.app.workspace.openLinkText(filePath, '', true);
+                    }
+                    return;
+                }
+            }
+
+            // Fallback: try to open existing file
+            const filePath = `${this.settings.syncFolder}/${this.settings.conceptsSubfolder}/${conceptName}.md`;
+            const file = this.app.vault.getAbstractFileByPath(filePath);
+
+            if (file instanceof TFile) {
+                await this.app.workspace.openLinkText(filePath, '', true);
+                new Notice(`Opened "${conceptName}"`);
+            } else {
+                new Notice(`Concept "${conceptName}" not found. Sync with Oracle first.`);
+            }
+        } catch (error: any) {
+            console.error('Sync and open error:', error);
+            new Notice(`Failed to sync: ${error.message}`);
         }
     }
 
@@ -3469,7 +5508,7 @@ class VoiceNoteModal extends Modal {
             // Check if we're in remote (athlete) mode
             if (this.plugin.settings.mode === 'remote' && this.plugin.settings.athleteToken) {
                 // REMOTE MODE: Use Heroku transcription
-                this.statusEl.setText('Transcribing via cloud (30s max, 5/day)...');
+                this.statusEl.setText('Transcribing via cloud (2min max, 5/day)...');
 
                 try {
                     const result = await this.plugin.remoteTranscribe(audioBlob);
@@ -3486,8 +5525,8 @@ class VoiceNoteModal extends Modal {
                         this.statusEl.setText('Daily voice note limit reached (5/day)');
                         new Notice('You have used all 5 voice notes for today. Try again tomorrow!');
                     } else if (error.message.includes('too long')) {
-                        this.statusEl.setText('Recording too long (max 30 seconds)');
-                        new Notice('Voice notes are limited to 30 seconds. Please record a shorter message.');
+                        this.statusEl.setText('Recording too long (max 2 minutes)');
+                        new Notice('Voice notes are limited to 2 minutes. Please record a shorter message.');
                     } else {
                         throw error;
                     }
@@ -4019,7 +6058,7 @@ ${transcript}
             const audio = new Audio(audioUrl);
             audio.play().catch(err => console.error('Audio error:', err));
 
-            this.statusEl.setText('Coach is speaking...');
+            this.statusEl.setText('Oracle is speaking...');
             this.statusEl.style.color = 'var(--text-accent)';
             audio.onended = () => {
                 this.statusEl.setText('Your turn - record your answer');
@@ -4046,7 +6085,7 @@ ${transcript}
         // Check state - if RESEARCHING, show big "Generate Wisdom" button
         if (session.state === 'RESEARCHING') {
             const isRemote = this.plugin.isRemoteMode();
-            this.statusEl.setText(isRemote ? 'Ready to send to coach!' : 'Ready to generate wisdom!');
+            this.statusEl.setText(isRemote ? 'Ready to send to Oracle!' : 'Ready to generate wisdom!');
             this.statusEl.style.color = 'var(--text-success)';
 
             const bigBtnContainer = this.resultEl.createDiv();
@@ -4054,7 +6093,7 @@ ${transcript}
             bigBtnContainer.style.marginTop = '30px';
 
             const generateBtn = bigBtnContainer.createEl('button', {
-                text: isRemote ? '📤 Send to Coach' : '✨ Generate Wisdom',
+                text: isRemote ? '📤 Send to Oracle' : '✨ Generate Wisdom',
                 cls: 'mod-cta'
             });
             generateBtn.style.fontSize = '1.4em';
@@ -4078,7 +6117,7 @@ ${transcript}
 
                     const jobId = await plugin.submitToCoach(topic, therapyContext);
                     if (jobId) {
-                        new Notice('Query sent to coach! Check back later for results.', 5000);
+                        new Notice('Query sent to Oracle! Check back later for results.', 5000);
                     }
                     this.close();
                     return;
@@ -4986,7 +7025,7 @@ ${audioEmbeds.join('\n\n')}
                     let researchLink = '';
                     if (this.savedFilePath) {
                         const researchFileName = this.savedFilePath.split('/').pop()?.replace('.md', '') || '';
-                        researchLink = `> 📚 **Based on research:** [[${researchFileName}]]\n\n`;
+                        researchLink = `> **Based on research:** [[${researchFileName}]]\n\n`;
                     }
 
                     // Add frontmatter, research link, content, and video section
@@ -5181,6 +7220,2487 @@ class CoachAddAthleteModal extends Modal {
                         new Notice('Failed to add athlete');
                     }
                 }));
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// Athlete selection modal for sharing content
+class AthleteSelectModal extends Modal {
+    athletes: any[];
+    onSelect: (athlete: any) => void;
+
+    constructor(app: App, athletes: any[], onSelect: (athlete: any) => void) {
+        super(app);
+        this.athletes = athletes;
+        this.onSelect = onSelect;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl('h2', { text: 'Select Athlete' });
+        contentEl.createEl('p', { text: 'Choose an athlete to share this content with:' });
+
+        const listEl = contentEl.createEl('div', { cls: 'athlete-select-list' });
+
+        for (const athlete of this.athletes) {
+            const athleteEl = listEl.createEl('div', { cls: 'athlete-select-item' });
+            athleteEl.style.cssText = 'padding: 10px; margin: 5px 0; border-radius: 5px; cursor: pointer; background: var(--background-secondary);';
+
+            const name = athlete.display_name || athlete.discord_username || `Athlete ${athlete.id}`;
+            athleteEl.createEl('strong', { text: name });
+
+            if (athlete.discord_username && athlete.discord_username !== name) {
+                athleteEl.createEl('span', {
+                    text: ` (@${athlete.discord_username})`,
+                    cls: 'athlete-discord-name'
+                });
+            }
+
+            athleteEl.addEventListener('click', () => {
+                this.onSelect(athlete);
+                this.close();
+            });
+
+            athleteEl.addEventListener('mouseenter', () => {
+                athleteEl.style.background = 'var(--background-modifier-hover)';
+            });
+            athleteEl.addEventListener('mouseleave', () => {
+                athleteEl.style.background = 'var(--background-secondary)';
+            });
+        }
+
+        new Setting(contentEl)
+            .addButton(btn => btn
+                .setButtonText('Cancel')
+                .onClick(() => this.close()));
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// Article Bibliography Modal - Shows ALL videos from an Oracle article
+class ArticleBibliographyModal extends Modal {
+    plugin: BJJFlipmodePlugin;
+    bibliographyData: any;
+    sourceFile: TFile;
+
+    constructor(app: App, plugin: BJJFlipmodePlugin, bibliographyData: any, sourceFile: TFile) {
+        super(app);
+        this.plugin = plugin;
+        this.bibliographyData = bibliographyData;
+        this.sourceFile = sourceFile;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        const { bibliographyData } = this;
+
+        // Header
+        contentEl.createEl('h2', { text: 'Article Source Videos' });
+
+        // Original query
+        const queryEl = contentEl.createEl('div', { cls: 'original-query' });
+        queryEl.style.cssText = 'margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px; border-left: 3px solid var(--interactive-accent);';
+        queryEl.createEl('p', {
+            text: `Original Question: "${bibliographyData.original_query}"`,
+            cls: 'query-text'
+        });
+
+        // Stats
+        const statsEl = contentEl.createEl('div', { cls: 'bibliography-stats' });
+        statsEl.style.cssText = 'margin-bottom: 15px; display: flex; gap: 15px;';
+        statsEl.createEl('span', { text: `📹 ${bibliographyData.total_videos} videos` });
+        statsEl.createEl('span', { text: `👤 ${bibliographyData.instructors.length} instructors` });
+
+        // Instructions
+        contentEl.createEl('p', {
+            text: 'Click any video to view its full concept cache with timestamps:',
+            cls: 'bibliography-instructions'
+        });
+
+        // Videos list - grouped by instructor
+        const listEl = contentEl.createEl('div', { cls: 'videos-list' });
+        listEl.style.cssText = 'max-height: 450px; overflow-y: auto;';
+
+        // Group videos by instructor
+        const byInstructor: { [key: string]: any[] } = {};
+        for (const video of bibliographyData.videos) {
+            const instructor = video.instructor || 'Unknown';
+            if (!byInstructor[instructor]) {
+                byInstructor[instructor] = [];
+            }
+            byInstructor[instructor].push(video);
+        }
+
+        // Render each instructor group
+        for (const instructor of Object.keys(byInstructor).sort()) {
+            const groupEl = listEl.createEl('div', { cls: 'instructor-group' });
+            groupEl.style.cssText = 'margin-bottom: 15px;';
+
+            const headerEl = groupEl.createEl('h3', { text: `👤 ${instructor}` });
+            headerEl.style.cssText = 'margin: 10px 0 5px 0; font-size: 1.1em; color: var(--text-accent);';
+
+            for (const video of byInstructor[instructor]) {
+                const videoEl = groupEl.createEl('div', { cls: 'video-item' });
+                videoEl.style.cssText = 'padding: 10px; margin: 5px 0; border-radius: 5px; background: var(--background-secondary); cursor: pointer; border-left: 3px solid var(--interactive-accent);';
+
+                // Title row
+                const titleRow = videoEl.createEl('div', { cls: 'title-row' });
+                titleRow.style.cssText = 'display: flex; justify-content: space-between; align-items: center;';
+
+                titleRow.createEl('strong', { text: video.video_title });
+
+                // Citations badge
+                const citationsBadge = titleRow.createEl('span', { cls: 'citations-badge' });
+                citationsBadge.style.cssText = 'background: var(--interactive-accent); color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8em;';
+                citationsBadge.textContent = `${video.citations_count} citation${video.citations_count !== 1 ? 's' : ''}`;
+
+                // Timestamps preview
+                if (video.timestamps && video.timestamps.length > 0) {
+                    const timestampsEl = videoEl.createEl('div', { cls: 'timestamps-preview' });
+                    timestampsEl.style.cssText = 'margin-top: 5px; font-size: 0.85em; color: var(--text-muted);';
+                    timestampsEl.textContent = `Timestamps: ${video.timestamps.slice(0, 5).join(', ')}${video.timestamps.length > 5 ? '...' : ''}`;
+                }
+
+                // Click handler - open VideoExplorerModal with this video's concept cache
+                videoEl.addEventListener('click', async () => {
+                    videoEl.style.background = 'var(--background-modifier-hover)';
+                    titleRow.createEl('span', { text: ' Loading...', cls: 'loading-text' });
+
+                    try {
+                        // Get the full concept cache for this video
+                        const response = await requestUrl({
+                            url: `${this.plugin.settings.serverUrl}/api/obsidian/explore-video`,
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Authorization': `Bearer ${this.plugin.settings.apiToken}`
+                            },
+                            body: JSON.stringify({
+                                video_id: video.video_id,
+                                concept: video.video_title  // Use video title as fallback
+                            })
+                        });
+
+                        const data = response.json;
+
+                        if (data.error) {
+                            new Notice(`Could not load concept cache for this video`, 3000);
+                            videoEl.style.background = 'var(--background-secondary)';
+                            const loadingText = videoEl.querySelector('.loading-text');
+                            if (loadingText) loadingText.remove();
+                            return;
+                        }
+
+                        // Close bibliography and open video explorer
+                        this.close();
+                        const modal = new VideoExplorerModal(
+                            this.app,
+                            this.plugin,
+                            data,
+                            this.sourceFile
+                        );
+                        modal.open();
+
+                    } catch (error: any) {
+                        new Notice(`Failed to load: ${error.message}`, 3000);
+                        videoEl.style.background = 'var(--background-secondary)';
+                        const loadingText = videoEl.querySelector('.loading-text');
+                        if (loadingText) loadingText.remove();
+                    }
+                });
+
+                // Hover effects
+                videoEl.addEventListener('mouseenter', () => {
+                    videoEl.style.background = 'var(--background-modifier-hover)';
+                });
+                videoEl.addEventListener('mouseleave', () => {
+                    videoEl.style.background = 'var(--background-secondary)';
+                });
+            }
+        }
+
+        // Footer
+        const footerEl = contentEl.createEl('div', { cls: 'modal-footer' });
+        footerEl.style.cssText = 'margin-top: 20px; display: flex; gap: 10px;';
+
+        new Setting(footerEl)
+            .addButton(btn => btn
+                .setButtonText('Close')
+                .onClick(() => this.close()));
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// Catalog Browser Modal - Browse full video catalog and select for cross-reference
+class CatalogBrowserModal extends Modal {
+    plugin: BJJFlipmodePlugin;
+    concept: string;
+    conceptContext: string;
+    sourceFile: TFile;
+    selectedVideos: Set<string> = new Set();
+    catalogData: any = null;
+
+    constructor(app: App, plugin: BJJFlipmodePlugin, concept: string, conceptContext: string, sourceFile: TFile) {
+        super(app);
+        this.plugin = plugin;
+        this.concept = concept;
+        this.conceptContext = conceptContext;
+        this.sourceFile = sourceFile;
+    }
+
+    async onOpen() {
+        const { contentEl } = this;
+
+        // Header
+        contentEl.createEl('h2', { text: 'Cross-Reference Research' });
+
+        // Concept info
+        const conceptEl = contentEl.createEl('div', { cls: 'concept-info' });
+        conceptEl.style.cssText = 'margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px; border-left: 3px solid var(--interactive-accent);';
+        conceptEl.createEl('p', { text: `Concept: "${this.concept}"` });
+        if (this.conceptContext) {
+            conceptEl.createEl('p', { text: `Context: ${this.conceptContext}`, cls: 'context-text' });
+        }
+
+        // Loading indicator
+        const loadingEl = contentEl.createEl('div', { cls: 'loading', text: 'Loading video catalog...' });
+        loadingEl.style.cssText = 'padding: 20px; text-align: center;';
+
+        try {
+            // Fetch catalog
+            const response = await requestUrl({
+                url: `${this.plugin.settings.serverUrl}/api/obsidian/catalog`,
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${this.plugin.settings.apiToken}`
+                }
+            });
+
+            this.catalogData = response.json;
+            loadingEl.remove();
+
+            // Instructions
+            contentEl.createEl('p', {
+                text: `Select videos to cross-reference (${this.catalogData.total_videos} available):`,
+                cls: 'catalog-instructions'
+            });
+
+            // Selected count display
+            const selectedCountEl = contentEl.createEl('div', { cls: 'selected-count' });
+            selectedCountEl.style.cssText = 'margin-bottom: 10px; font-weight: bold; color: var(--text-accent);';
+            selectedCountEl.textContent = '0 videos selected';
+
+            // Search filter
+            const searchEl = contentEl.createEl('input', { type: 'text', placeholder: 'Filter instructors/series...' });
+            searchEl.style.cssText = 'width: 100%; padding: 8px; margin-bottom: 10px; border-radius: 5px; border: 1px solid var(--background-modifier-border);';
+
+            // Catalog list
+            const listEl = contentEl.createEl('div', { cls: 'catalog-list' });
+            listEl.style.cssText = 'max-height: 350px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: 5px; padding: 10px;';
+
+            const updateSelectedCount = () => {
+                selectedCountEl.textContent = `${this.selectedVideos.size} videos selected`;
+            };
+
+            const renderCatalog = (filter: string = '') => {
+                listEl.empty();
+                const filterLower = filter.toLowerCase();
+
+                for (const instructor of this.catalogData.instructors) {
+                    // Check if instructor matches filter
+                    const instructorMatches = instructor.name.toLowerCase().includes(filterLower);
+                    const matchingSeries = instructor.series.filter((s: any) =>
+                        instructorMatches || s.name.toLowerCase().includes(filterLower)
+                    );
+
+                    if (matchingSeries.length === 0 && !instructorMatches) continue;
+
+                    // Instructor group
+                    const groupEl = listEl.createEl('div', { cls: 'instructor-group' });
+                    groupEl.style.cssText = 'margin-bottom: 10px;';
+
+                    // Instructor header with expand/collapse
+                    const headerEl = groupEl.createEl('div', { cls: 'instructor-header' });
+                    headerEl.style.cssText = 'display: flex; align-items: center; gap: 8px; cursor: pointer; padding: 5px; background: var(--background-secondary); border-radius: 3px;';
+
+                    const expandIcon = headerEl.createEl('span', { text: '▶' });
+                    expandIcon.style.cssText = 'font-size: 0.8em; transition: transform 0.2s;';
+
+                    // Select all checkbox for instructor
+                    const instructorCheckbox = headerEl.createEl('input', { type: 'checkbox' });
+                    instructorCheckbox.style.cssText = 'margin-right: 5px;';
+
+                    headerEl.createEl('strong', { text: `${instructor.name} (${instructor.video_count})` });
+
+                    // Series container (collapsible)
+                    const seriesContainer = groupEl.createEl('div', { cls: 'series-container' });
+                    seriesContainer.style.cssText = 'display: none; margin-left: 20px; margin-top: 5px;';
+
+                    // Toggle expand/collapse
+                    headerEl.addEventListener('click', (e) => {
+                        if (e.target === instructorCheckbox) return;
+                        const isExpanded = seriesContainer.style.display !== 'none';
+                        seriesContainer.style.display = isExpanded ? 'none' : 'block';
+                        expandIcon.style.transform = isExpanded ? '' : 'rotate(90deg)';
+                    });
+
+                    // Render series
+                    const seriesToRender = instructorMatches ? instructor.series : matchingSeries;
+                    for (const series of seriesToRender) {
+                        const seriesEl = seriesContainer.createEl('div', { cls: 'series-item' });
+                        seriesEl.style.cssText = 'margin: 5px 0; padding: 5px; border-left: 2px solid var(--background-modifier-border);';
+
+                        // Series header
+                        const seriesHeader = seriesEl.createEl('div', { cls: 'series-header' });
+                        seriesHeader.style.cssText = 'display: flex; align-items: center; gap: 5px;';
+
+                        const seriesCheckbox = seriesHeader.createEl('input', { type: 'checkbox' });
+                        seriesHeader.createEl('span', { text: `${series.name} (${series.video_count})` });
+
+                        // Individual videos
+                        const videosEl = seriesEl.createEl('div', { cls: 'videos-list' });
+                        videosEl.style.cssText = 'margin-left: 20px; font-size: 0.9em;';
+
+                        const videoCheckboxes: HTMLInputElement[] = [];
+
+                        for (const video of series.videos) {
+                            const videoEl = videosEl.createEl('div', { cls: 'video-item' });
+                            videoEl.style.cssText = 'display: flex; align-items: center; gap: 5px; padding: 2px 0;';
+
+                            const videoCheckbox = videoEl.createEl('input', { type: 'checkbox' }) as HTMLInputElement;
+                            videoCheckbox.dataset.videoId = video.video_id;
+                            videoCheckboxes.push(videoCheckbox);
+
+                            if (this.selectedVideos.has(video.video_id)) {
+                                videoCheckbox.checked = true;
+                            }
+
+                            videoCheckbox.addEventListener('change', () => {
+                                if (videoCheckbox.checked) {
+                                    this.selectedVideos.add(video.video_id);
+                                } else {
+                                    this.selectedVideos.delete(video.video_id);
+                                }
+                                updateSelectedCount();
+                            });
+
+                            const volText = video.volume ? ` (Vol ${video.volume})` : '';
+                            videoEl.createEl('span', { text: video.title + volText });
+                        }
+
+                        // Series checkbox selects all videos in series
+                        seriesCheckbox.addEventListener('change', () => {
+                            for (const cb of videoCheckboxes) {
+                                cb.checked = seriesCheckbox.checked;
+                                if (seriesCheckbox.checked) {
+                                    this.selectedVideos.add(cb.dataset.videoId!);
+                                } else {
+                                    this.selectedVideos.delete(cb.dataset.videoId!);
+                                }
+                            }
+                            updateSelectedCount();
+                        });
+                    }
+
+                    // Instructor checkbox selects all series
+                    instructorCheckbox.addEventListener('change', () => {
+                        const allCheckboxes = seriesContainer.querySelectorAll('input[type="checkbox"]') as NodeListOf<HTMLInputElement>;
+                        allCheckboxes.forEach(cb => {
+                            cb.checked = instructorCheckbox.checked;
+                            if (cb.dataset.videoId) {
+                                if (instructorCheckbox.checked) {
+                                    this.selectedVideos.add(cb.dataset.videoId);
+                                } else {
+                                    this.selectedVideos.delete(cb.dataset.videoId);
+                                }
+                            }
+                        });
+                        updateSelectedCount();
+                    });
+                }
+            };
+
+            renderCatalog();
+
+            // Filter handler
+            searchEl.addEventListener('input', () => {
+                renderCatalog(searchEl.value);
+            });
+
+            // Footer
+            const footerEl = contentEl.createEl('div', { cls: 'modal-footer' });
+            footerEl.style.cssText = 'margin-top: 15px; display: flex; gap: 10px; justify-content: flex-end;';
+
+            new Setting(footerEl)
+                .addButton(btn => btn
+                    .setButtonText('Run Cross-Reference')
+                    .setCta()
+                    .onClick(async () => {
+                        if (this.selectedVideos.size === 0) {
+                            new Notice('Select at least one video to cross-reference');
+                            return;
+                        }
+
+                        btn.setButtonText('Researching...');
+                        btn.setDisabled(true);
+
+                        try {
+                            const response = await requestUrl({
+                                url: `${this.plugin.settings.serverUrl}/api/obsidian/cross-reference`,
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': `Bearer ${this.plugin.settings.apiToken}`
+                                },
+                                body: JSON.stringify({
+                                    concept: this.concept,
+                                    concept_context: this.conceptContext,
+                                    video_ids: Array.from(this.selectedVideos)
+                                })
+                            });
+
+                            const data = response.json;
+
+                            if (data.error) {
+                                new Notice(`Error: ${data.error}`);
+                                btn.setButtonText('Run Cross-Reference');
+                                btn.setDisabled(false);
+                                return;
+                            }
+
+                            // Show results in new modal
+                            this.close();
+                            const resultsModal = new CrossReferenceResultsModal(
+                                this.app,
+                                this.plugin,
+                                data,
+                                this.sourceFile
+                            );
+                            resultsModal.open();
+
+                        } catch (error: any) {
+                            new Notice(`Failed: ${error.message}`);
+                            btn.setButtonText('Run Cross-Reference');
+                            btn.setDisabled(false);
+                        }
+                    }))
+                .addButton(btn => btn
+                    .setButtonText('Cancel')
+                    .onClick(() => this.close()));
+
+        } catch (error: any) {
+            loadingEl.textContent = `Failed to load catalog: ${error.message}`;
+        }
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// Cross-Reference Results Modal
+class CrossReferenceResultsModal extends Modal {
+    plugin: BJJFlipmodePlugin;
+    resultsData: any;
+    sourceFile: TFile;
+
+    constructor(app: App, plugin: BJJFlipmodePlugin, resultsData: any, sourceFile: TFile) {
+        super(app);
+        this.plugin = plugin;
+        this.resultsData = resultsData;
+        this.sourceFile = sourceFile;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        const { resultsData } = this;
+
+        // Header
+        contentEl.createEl('h2', { text: '📊 Cross-Reference Results' });
+
+        // Stats
+        const statsEl = contentEl.createEl('div', { cls: 'results-stats' });
+        statsEl.style.cssText = 'margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px;';
+        statsEl.createEl('p', { text: `Concept: "${resultsData.concept}"` });
+        statsEl.createEl('p', { text: `📹 ${resultsData.videos_analyzed} videos analyzed` });
+        statsEl.createEl('p', { text: `🧠 ${resultsData.thinkers_used} thinker perspectives used` });
+
+        // Sources used
+        const sourcesEl = contentEl.createEl('div', { cls: 'sources-used' });
+        sourcesEl.style.cssText = 'margin-bottom: 15px;';
+        sourcesEl.createEl('h4', { text: 'Sources Cross-Referenced:' });
+        const sourcesList = sourcesEl.createEl('ul');
+        for (const src of resultsData.sources) {
+            sourcesList.createEl('li', { text: `${src.instructor} - ${src.video_name}` });
+        }
+
+        // Research content
+        const researchEl = contentEl.createEl('div', { cls: 'research-content' });
+        researchEl.style.cssText = 'max-height: 400px; overflow-y: auto; padding: 15px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: 5px; white-space: pre-wrap; font-family: var(--font-text);';
+        researchEl.textContent = resultsData.research;
+
+        // Footer
+        const footerEl = contentEl.createEl('div', { cls: 'modal-footer' });
+        footerEl.style.cssText = 'margin-top: 15px; display: flex; gap: 10px;';
+
+        new Setting(footerEl)
+            .addButton(btn => btn
+                .setButtonText('Save to Note')
+                .setCta()
+                .onClick(async () => {
+                    // Save as a new note
+                    const fileName = `Cross-Reference - ${resultsData.concept.substring(0, 30)}.md`;
+                    const folderPath = this.sourceFile.parent?.path || this.plugin.settings.syncFolder;
+                    const filePath = `${folderPath}/${fileName}`;
+
+                    const content = `---
+type: cross-reference
+concept: "${resultsData.concept}"
+videos_analyzed: ${resultsData.videos_analyzed}
+thinkers_used: ${resultsData.thinkers_used}
+date: ${new Date().toISOString().split('T')[0]}
+---
+
+# Cross-Reference: ${resultsData.concept}
+
+## Sources Analyzed
+${resultsData.sources.map((s: any) => `- ${s.instructor} - ${s.video_name}`).join('\n')}
+
+## Research
+
+${resultsData.research}
+`;
+
+                    try {
+                        await this.app.vault.create(filePath, content);
+                        new Notice(`Saved to ${fileName}`);
+                        this.close();
+
+                        // Open the new file
+                        const newFile = this.app.vault.getAbstractFileByPath(filePath);
+                        if (newFile instanceof TFile) {
+                            await this.app.workspace.getLeaf().openFile(newFile);
+                        }
+                    } catch (error: any) {
+                        new Notice(`Failed to save: ${error.message}`);
+                    }
+                }))
+            .addButton(btn => btn
+                .setButtonText('Copy to Clipboard')
+                .onClick(async () => {
+                    await navigator.clipboard.writeText(resultsData.research);
+                    new Notice('Copied to clipboard!');
+                }))
+            .addButton(btn => btn
+                .setButtonText('Close')
+                .onClick(() => this.close()));
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// Enrich Checkpoint Modal - RLM feedback loop for knowledge graph refinement
+class EnrichCheckpointModal extends Modal {
+    plugin: BJJFlipmodePlugin;
+    checkpointData: {
+        name: string;
+        cluster: string;
+        currentInvariables: string[];
+        currentVariables: string[];
+        goal: string;
+        successTest: string;
+    };
+    sourceFile: TFile;
+    selectedVideos: Set<string> = new Set();
+    catalogData: any = null;
+
+    constructor(app: App, plugin: BJJFlipmodePlugin, checkpointData: any, sourceFile: TFile) {
+        super(app);
+        this.plugin = plugin;
+        this.checkpointData = checkpointData;
+        this.sourceFile = sourceFile;
+    }
+
+    async onOpen() {
+        const { contentEl } = this;
+        const { checkpointData } = this;
+
+        // Header
+        contentEl.createEl('h2', { text: 'RLM Checkpoint Enrichment' });
+
+        // Checkpoint info
+        const infoEl = contentEl.createEl('div', { cls: 'checkpoint-info' });
+        infoEl.style.cssText = 'margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px; border-left: 3px solid var(--text-accent);';
+        infoEl.createEl('h3', { text: checkpointData.name });
+        infoEl.createEl('p', { text: `Cluster: ${checkpointData.cluster}` });
+
+        // Current state
+        const currentEl = contentEl.createEl('div', { cls: 'current-state' });
+        currentEl.style.cssText = 'margin-bottom: 15px; padding: 10px; background: var(--background-primary-alt); border-radius: 5px;';
+        currentEl.createEl('h4', { text: 'Current Knowledge:' });
+
+        const invariablesEl = currentEl.createEl('div');
+        invariablesEl.createEl('strong', { text: 'Invariables: ' });
+        invariablesEl.createEl('span', {
+            text: checkpointData.currentInvariables.length > 0
+                ? checkpointData.currentInvariables.join(', ')
+                : '(none)'
+        });
+
+        const variablesEl = currentEl.createEl('div');
+        variablesEl.createEl('strong', { text: 'Variables: ' });
+        variablesEl.createEl('span', {
+            text: checkpointData.currentVariables.length > 0
+                ? checkpointData.currentVariables.length + ' IF/THEN branches'
+                : '(none)'
+        });
+
+        // Loading catalog
+        const loadingEl = contentEl.createEl('div', { text: 'Loading video catalog...' });
+        loadingEl.style.cssText = 'padding: 20px; text-align: center;';
+
+        try {
+            const response = await requestUrl({
+                url: `${this.plugin.settings.serverUrl}/api/obsidian/catalog`,
+                method: 'GET',
+                headers: { 'Authorization': `Bearer ${this.plugin.settings.apiToken}` }
+            });
+            this.catalogData = response.json;
+            loadingEl.remove();
+
+            // Instructions
+            contentEl.createEl('p', {
+                text: `Select videos to analyze for enrichment (${this.catalogData.total_videos} available):`,
+                cls: 'enrich-instructions'
+            });
+
+            // Selected count
+            const selectedCountEl = contentEl.createEl('div', { cls: 'selected-count' });
+            selectedCountEl.style.cssText = 'margin-bottom: 10px; font-weight: bold; color: var(--text-accent);';
+            selectedCountEl.textContent = '0 videos selected';
+
+            const updateCount = () => {
+                selectedCountEl.textContent = `${this.selectedVideos.size} videos selected`;
+            };
+
+            // Search filter
+            const searchEl = contentEl.createEl('input', { type: 'text', placeholder: 'Filter instructors/series...' });
+            searchEl.style.cssText = 'width: 100%; padding: 8px; margin-bottom: 10px; border-radius: 5px; border: 1px solid var(--background-modifier-border);';
+
+            // Catalog list (compact version)
+            const listEl = contentEl.createEl('div', { cls: 'catalog-list' });
+            listEl.style.cssText = 'max-height: 250px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: 5px; padding: 10px;';
+
+            const renderCatalog = (filter: string = '') => {
+                listEl.empty();
+                const filterLower = filter.toLowerCase();
+
+                for (const instructor of this.catalogData.instructors) {
+                    const instructorMatches = instructor.name.toLowerCase().includes(filterLower);
+                    const matchingSeries = instructor.series.filter((s: any) =>
+                        instructorMatches || s.name.toLowerCase().includes(filterLower)
+                    );
+
+                    if (matchingSeries.length === 0 && !instructorMatches) continue;
+
+                    const groupEl = listEl.createEl('div', { cls: 'instructor-group' });
+                    groupEl.style.cssText = 'margin-bottom: 8px;';
+
+                    const headerEl = groupEl.createEl('div', { cls: 'instructor-header' });
+                    headerEl.style.cssText = 'display: flex; align-items: center; gap: 5px; cursor: pointer; padding: 3px; background: var(--background-secondary); border-radius: 3px;';
+
+                    const expandIcon = headerEl.createEl('span', { text: '▶' });
+                    expandIcon.style.cssText = 'font-size: 0.7em;';
+
+                    const instructorCb = headerEl.createEl('input', { type: 'checkbox' }) as HTMLInputElement;
+                    headerEl.createEl('span', { text: `${instructor.name} (${instructor.video_count})` });
+
+                    const seriesContainer = groupEl.createEl('div');
+                    seriesContainer.style.cssText = 'display: none; margin-left: 15px; font-size: 0.9em;';
+
+                    headerEl.addEventListener('click', (e) => {
+                        if (e.target === instructorCb) return;
+                        const isExpanded = seriesContainer.style.display !== 'none';
+                        seriesContainer.style.display = isExpanded ? 'none' : 'block';
+                        expandIcon.style.transform = isExpanded ? '' : 'rotate(90deg)';
+                    });
+
+                    const allVideoIds: string[] = [];
+                    const seriesToRender = instructorMatches ? instructor.series : matchingSeries;
+
+                    for (const series of seriesToRender) {
+                        const seriesEl = seriesContainer.createEl('div');
+                        seriesEl.style.cssText = 'display: flex; align-items: center; gap: 5px; padding: 2px 0;';
+
+                        const seriesCb = seriesEl.createEl('input', { type: 'checkbox' }) as HTMLInputElement;
+                        seriesEl.createEl('span', { text: `${series.name} (${series.video_count})` });
+
+                        const videoIds = series.videos.map((v: any) => v.video_id);
+                        allVideoIds.push(...videoIds);
+
+                        // Check if already selected
+                        const allSelected = videoIds.every((id: string) => this.selectedVideos.has(id));
+                        seriesCb.checked = allSelected;
+
+                        seriesCb.addEventListener('change', () => {
+                            for (const id of videoIds) {
+                                if (seriesCb.checked) {
+                                    this.selectedVideos.add(id);
+                                } else {
+                                    this.selectedVideos.delete(id);
+                                }
+                            }
+                            updateCount();
+                        });
+                    }
+
+                    instructorCb.addEventListener('change', () => {
+                        const checkboxes = seriesContainer.querySelectorAll('input[type="checkbox"]') as NodeListOf<HTMLInputElement>;
+                        checkboxes.forEach(cb => cb.checked = instructorCb.checked);
+                        for (const id of allVideoIds) {
+                            if (instructorCb.checked) {
+                                this.selectedVideos.add(id);
+                            } else {
+                                this.selectedVideos.delete(id);
+                            }
+                        }
+                        updateCount();
+                    });
+                }
+            };
+
+            renderCatalog();
+            searchEl.addEventListener('input', () => renderCatalog(searchEl.value));
+
+            // Footer
+            const footerEl = contentEl.createEl('div', { cls: 'modal-footer' });
+            footerEl.style.cssText = 'margin-top: 15px; display: flex; gap: 10px; justify-content: flex-end;';
+
+            new Setting(footerEl)
+                .addButton(btn => btn
+                    .setButtonText('Run Enrichment')
+                    .setCta()
+                    .onClick(async () => {
+                        if (this.selectedVideos.size === 0) {
+                            new Notice('Select at least one video');
+                            return;
+                        }
+
+                        btn.setButtonText('Analyzing...');
+                        btn.setDisabled(true);
+
+                        try {
+                            const response = await requestUrl({
+                                url: `${this.plugin.settings.serverUrl}/api/obsidian/enrich-checkpoint`,
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': `Bearer ${this.plugin.settings.apiToken}`
+                                },
+                                body: JSON.stringify({
+                                    checkpoint_name: checkpointData.name,
+                                    checkpoint_cluster: checkpointData.cluster,
+                                    current_invariables: checkpointData.currentInvariables,
+                                    current_variables: checkpointData.currentVariables,
+                                    goal: checkpointData.goal,
+                                    success_test: checkpointData.successTest,
+                                    video_ids: Array.from(this.selectedVideos)
+                                })
+                            });
+
+                            const enrichments = response.json;
+
+                            if (enrichments.error) {
+                                new Notice(`Error: ${enrichments.error}`);
+                                btn.setButtonText('Run Enrichment');
+                                btn.setDisabled(false);
+                                return;
+                            }
+
+                            // Show enrichment results
+                            this.close();
+                            const resultsModal = new EnrichmentResultsModal(
+                                this.app,
+                                this.plugin,
+                                enrichments,
+                                this.sourceFile,
+                                checkpointData
+                            );
+                            resultsModal.open();
+
+                        } catch (error: any) {
+                            new Notice(`Failed: ${error.message}`);
+                            btn.setButtonText('Run Enrichment');
+                            btn.setDisabled(false);
+                        }
+                    }))
+                .addButton(btn => btn
+                    .setButtonText('Cancel')
+                    .onClick(() => this.close()));
+
+        } catch (error: any) {
+            loadingEl.textContent = `Failed to load catalog: ${error.message}`;
+        }
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// Enrichment Results Modal - Shows proposed enrichments with accept/reject
+class EnrichmentResultsModal extends Modal {
+    plugin: BJJFlipmodePlugin;
+    enrichments: any;
+    sourceFile: TFile;
+    checkpointData: any;
+    acceptedInvariables: Set<number> = new Set();
+    acceptedVariables: Set<number> = new Set();
+
+    constructor(app: App, plugin: BJJFlipmodePlugin, enrichments: any, sourceFile: TFile, checkpointData: any) {
+        super(app);
+        this.plugin = plugin;
+        this.enrichments = enrichments;
+        this.sourceFile = sourceFile;
+        this.checkpointData = checkpointData;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        const { enrichments } = this;
+
+        // Header
+        contentEl.createEl('h2', { text: 'Enrichment Results' });
+
+        // Stats
+        const statsEl = contentEl.createEl('div', { cls: 'enrichment-stats' });
+        statsEl.style.cssText = 'margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px;';
+        statsEl.createEl('p', { text: `Checkpoint: ${enrichments.checkpoint_name}` });
+        statsEl.createEl('p', { text: `📹 ${enrichments.sources_analyzed} videos analyzed` });
+
+        // Scrollable content
+        const scrollEl = contentEl.createEl('div', { cls: 'enrichment-scroll' });
+        scrollEl.style.cssText = 'max-height: 400px; overflow-y: auto;';
+
+        // New Invariables
+        if (enrichments.new_invariables && enrichments.new_invariables.length > 0) {
+            const invSection = scrollEl.createEl('div', { cls: 'invariables-section' });
+            invSection.createEl('h3', { text: `New Invariables (${enrichments.new_invariables.length})` });
+
+            enrichments.new_invariables.forEach((inv: any, idx: number) => {
+                const itemEl = invSection.createEl('div', { cls: 'enrichment-item' });
+                itemEl.style.cssText = 'padding: 10px; margin: 5px 0; border-radius: 5px; background: var(--background-primary-alt); border-left: 3px solid var(--text-success);';
+
+                const headerRow = itemEl.createEl('div');
+                headerRow.style.cssText = 'display: flex; align-items: center; gap: 10px;';
+
+                const checkbox = headerRow.createEl('input', { type: 'checkbox' }) as HTMLInputElement;
+                checkbox.checked = true;
+                this.acceptedInvariables.add(idx);
+
+                checkbox.addEventListener('change', () => {
+                    if (checkbox.checked) {
+                        this.acceptedInvariables.add(idx);
+                    } else {
+                        this.acceptedInvariables.delete(idx);
+                    }
+                });
+
+                const tierBadge = headerRow.createEl('span', { cls: 'tier-badge' });
+                tierBadge.style.cssText = `padding: 2px 6px; border-radius: 3px; font-size: 0.8em; background: ${inv.tier === 'CRITICAL' ? 'var(--text-error)' : inv.tier === 'IMPORTANT' ? 'var(--text-warning)' : 'var(--text-muted)'}; color: white;`;
+                tierBadge.textContent = inv.tier;
+
+                headerRow.createEl('strong', { text: inv.name });
+
+                if (inv.source_instructor) {
+                    const sourceEl = itemEl.createEl('p');
+                    sourceEl.style.cssText = 'margin: 5px 0; font-size: 0.85em; color: var(--text-accent);';
+                    sourceEl.textContent = `Source: ${inv.source_instructor}${inv.timestamp ? ` [${inv.timestamp}]` : ''}`;
+                }
+
+                if (inv.description) {
+                    const descEl = itemEl.createEl('p');
+                    descEl.style.cssText = 'margin: 5px 0; font-size: 0.9em; color: var(--text-muted);';
+                    descEl.textContent = inv.description;
+                }
+            });
+        }
+
+        // New Variables
+        if (enrichments.new_variables && enrichments.new_variables.length > 0) {
+            const varSection = scrollEl.createEl('div', { cls: 'variables-section' });
+            varSection.style.cssText = 'margin-top: 15px;';
+            varSection.createEl('h3', { text: `🔀 New Variables (${enrichments.new_variables.length})` });
+
+            enrichments.new_variables.forEach((v: any, idx: number) => {
+                const itemEl = varSection.createEl('div', { cls: 'enrichment-item' });
+                itemEl.style.cssText = 'padding: 10px; margin: 5px 0; border-radius: 5px; background: var(--background-primary-alt); border-left: 3px solid var(--text-warning);';
+
+                const headerRow = itemEl.createEl('div');
+                headerRow.style.cssText = 'display: flex; align-items: center; gap: 10px;';
+
+                const checkbox = headerRow.createEl('input', { type: 'checkbox' }) as HTMLInputElement;
+                checkbox.checked = true;
+                this.acceptedVariables.add(idx);
+
+                checkbox.addEventListener('change', () => {
+                    if (checkbox.checked) {
+                        this.acceptedVariables.add(idx);
+                    } else {
+                        this.acceptedVariables.delete(idx);
+                    }
+                });
+
+                headerRow.createEl('strong', { text: `${v.condition} → ${v.action}` });
+
+                if (v.source_instructor) {
+                    const sourceEl = itemEl.createEl('p');
+                    sourceEl.style.cssText = 'margin: 5px 0; font-size: 0.85em; color: var(--text-accent);';
+                    sourceEl.textContent = `Source: ${v.source_instructor}${v.timestamp ? ` [${v.timestamp}]` : ''}`;
+                }
+
+                if (v.description) {
+                    const descEl = itemEl.createEl('p');
+                    descEl.style.cssText = 'margin: 5px 0; font-size: 0.9em; color: var(--text-muted);';
+                    descEl.textContent = v.description;
+                }
+            });
+        }
+
+        // Defensive Inversions
+        if (enrichments.defensive_inversions && enrichments.defensive_inversions.length > 0) {
+            const invSection = scrollEl.createEl('div', { cls: 'inversions-section' });
+            invSection.style.cssText = 'margin-top: 15px;';
+            invSection.createEl('h3', { text: `Defensive Inversions (${enrichments.defensive_inversions.length})` });
+
+            for (const inv of enrichments.defensive_inversions) {
+                const itemEl = invSection.createEl('div', { cls: 'inversion-item' });
+                itemEl.style.cssText = 'padding: 10px; margin: 5px 0; border-radius: 5px; background: var(--background-primary-alt); border-left: 3px solid var(--interactive-accent);';
+
+                itemEl.createEl('p', { text: `Defender wants: ${inv.defensive_concept}` });
+                itemEl.createEl('p', { text: `→ You should: ${inv.offensive_counter}` });
+                if (inv.source_instructor) {
+                    const srcEl = itemEl.createEl('p');
+                    srcEl.style.cssText = 'font-size: 0.85em; color: var(--text-accent);';
+                    srcEl.textContent = `Source: ${inv.source_instructor}`;
+                }
+            }
+        }
+
+        // Key Insights
+        if (enrichments.key_insights && enrichments.key_insights.length > 0) {
+            const insightsSection = scrollEl.createEl('div', { cls: 'insights-section' });
+            insightsSection.style.cssText = 'margin-top: 15px;';
+            insightsSection.createEl('h3', { text: `Key Insights` });
+
+            const ul = insightsSection.createEl('ul');
+            for (const insight of enrichments.key_insights) {
+                ul.createEl('li', { text: insight });
+            }
+        }
+
+        // Footer
+        const footerEl = contentEl.createEl('div', { cls: 'modal-footer' });
+        footerEl.style.cssText = 'margin-top: 15px; display: flex; gap: 10px; justify-content: flex-end;';
+
+        new Setting(footerEl)
+            .addButton(btn => btn
+                .setButtonText('Apply Selected Enrichments')
+                .setCta()
+                .onClick(async () => {
+                    await this.applyEnrichments();
+                }))
+            .addButton(btn => btn
+                .setButtonText('Cancel')
+                .onClick(() => this.close()));
+    }
+
+    async applyEnrichments() {
+        const { enrichments, sourceFile, checkpointData } = this;
+
+        try {
+            // Read current file
+            let content = await this.app.vault.read(sourceFile);
+
+            // Get accepted invariables
+            const newInvariables = enrichments.new_invariables?.filter((_: any, idx: number) =>
+                this.acceptedInvariables.has(idx)
+            ) || [];
+
+            // Get accepted variables
+            const newVariables = enrichments.new_variables?.filter((_: any, idx: number) =>
+                this.acceptedVariables.has(idx)
+            ) || [];
+
+            if (newInvariables.length === 0 && newVariables.length === 0) {
+                new Notice('No enrichments selected');
+                return;
+            }
+
+            // Track created files for Canvas
+            const createdFiles: TFile[] = [];
+
+            // Add new invariables to the table (create method files with timestamps for WebM clips)
+            if (newInvariables.length > 0) {
+                const tableMatch = content.match(/(## INVARIABLES[\s\S]*?\| REFINEMENT \|[^\n]*)/);
+                if (tableMatch) {
+                    let newRows = '';
+                    for (const inv of newInvariables) {
+                        // Sanitize name for file path
+                        const safeName = inv.name.replace(/[\\/:*?"<>|]/g, '-').substring(0, 60);
+                        const conceptPath = `${sourceFile.parent?.path}/${safeName}.md`;
+
+                        const conceptContent = `---
+type: method
+method_type: invariable
+cluster: "${checkpointData.cluster}"
+tier: "${inv.tier}"
+source_instructor: "${inv.source_instructor || 'Unknown'}"
+video_id: "${inv.video_id || ''}"
+timestamp: "${inv.timestamp || ''}"
+clip_duration: 30
+enrichment_source: true
+---
+
+# ${inv.name}
+
+${inv.description || ''}
+
+## Clip Info
+- **Instructor:** ${inv.source_instructor || 'Unknown'}
+- **Timestamp:** ${inv.timestamp || 'N/A'}
+- **Video ID:** ${inv.video_id || 'N/A'}
+`;
+                        const existingFile = this.app.vault.getAbstractFileByPath(conceptPath);
+                        if (!existingFile) {
+                            const newFile = await this.app.vault.create(conceptPath, conceptContent);
+                            createdFiles.push(newFile);
+                        }
+
+                        const linkText = `[[${safeName}]]`;
+                        newRows += `| ${inv.tier} | ${linkText} |\n`;
+                    }
+
+                    const refinementMatch = content.match(/(\| REFINEMENT \|[^\n]*\n)/);
+                    if (refinementMatch) {
+                        content = content.replace(refinementMatch[1], newRows + refinementMatch[1]);
+                    }
+                }
+            }
+
+            // Add new variables (also create method files for IF/THEN branches)
+            if (newVariables.length > 0) {
+                const variablesMatch = content.match(/(## VARIABLES \(IF\/THEN\)\n\n)([\s\S]*?)(\n---)/);
+                if (variablesMatch) {
+                    let newVarText = '';
+                    for (const v of newVariables) {
+                        // Create a method file for the variable
+                        const safeName = v.condition.replace(/^IF\s*/i, '').replace(/[\\/:*?"<>|]/g, '-').substring(0, 50);
+                        const varPath = `${sourceFile.parent?.path}/VAR - ${safeName}.md`;
+
+                        const varContent = `---
+type: method
+method_type: variable
+cluster: "${checkpointData.cluster}"
+condition: "${v.condition}"
+action: "${v.action}"
+source_instructor: "${v.source_instructor || 'Unknown'}"
+video_id: "${v.video_id || ''}"
+timestamp: "${v.timestamp || ''}"
+clip_duration: 30
+enrichment_source: true
+---
+
+# ${v.condition}
+
+**Action:** ${v.action}
+
+${v.description || ''}
+
+## Clip Info
+- **Instructor:** ${v.source_instructor || 'Unknown'}
+- **Timestamp:** ${v.timestamp || 'N/A'}
+- **Video ID:** ${v.video_id || 'N/A'}
+`;
+                        const existingVarFile = this.app.vault.getAbstractFileByPath(varPath);
+                        if (!existingVarFile) {
+                            const newVarFile = await this.app.vault.create(varPath, varContent);
+                            createdFiles.push(newVarFile);
+                        }
+
+                        newVarText += `- **${v.condition}** → ${v.action} → [[VAR - ${safeName}]]\n`;
+                    }
+                    content = content.replace(
+                        variablesMatch[0],
+                        variablesMatch[1] + variablesMatch[2] + newVarText + variablesMatch[3]
+                    );
+                }
+            }
+
+            // Add enrichment metadata to frontmatter (remove old entries first to avoid duplicates)
+            const enrichmentDate = new Date().toISOString().split('T')[0];
+
+            if (content.includes('---\n')) {
+                const parts = content.split('---');
+                if (parts.length >= 2) {
+                    // Remove existing enrichment lines
+                    parts[1] = parts[1]
+                        .replace(/\nlast_enriched:.*$/gm, '')
+                        .replace(/\nenrichment_sources:.*$/gm, '')
+                        .trimEnd();
+                    // Add fresh enrichment data
+                    parts[1] += `\nlast_enriched: ${enrichmentDate}\nenrichment_sources: ${enrichments.sources_analyzed} videos\n`;
+                    content = parts.join('---');
+                }
+            }
+
+            // Save the file
+            await this.app.vault.modify(sourceFile, content);
+
+            // ========== ADD NODES TO CANVAS ==========
+            // Find the active Canvas and add nodes for new concepts
+            const canvasLeaves = this.app.workspace.getLeavesOfType('canvas');
+            if (canvasLeaves.length > 0 && createdFiles.length > 0) {
+                const canvasView = canvasLeaves[0].view as any;
+                const canvas = canvasView?.canvas;
+
+                if (canvas) {
+                    // Find the checkpoint node in the canvas
+                    let checkpointNode: any = null;
+                    let checkpointX = 0;
+                    let checkpointY = 0;
+
+                    for (const node of canvas.nodes.values()) {
+                        if (node.file?.path === sourceFile.path) {
+                            checkpointNode = node;
+                            checkpointX = node.x;
+                            checkpointY = node.y;
+                            break;
+                        }
+                    }
+
+                    // Add new nodes arranged around the checkpoint
+                    const nodeWidth = 250;
+                    const nodeHeight = 100;
+                    const spacing = 50;
+                    const startX = checkpointX + 350; // To the right of checkpoint
+                    let currentY = checkpointY - ((createdFiles.length - 1) * (nodeHeight + spacing)) / 2;
+
+                    for (const file of createdFiles) {
+                        // Create a file node on the canvas
+                        const nodeData = {
+                            id: `enrichment-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                            type: 'file',
+                            file: file.path,
+                            x: startX,
+                            y: currentY,
+                            width: nodeWidth,
+                            height: nodeHeight
+                        };
+
+                        canvas.createFileNode({
+                            file: file,
+                            pos: { x: startX, y: currentY },
+                            size: { width: nodeWidth, height: nodeHeight }
+                        });
+
+                        currentY += nodeHeight + spacing;
+                    }
+
+                    // Request canvas save
+                    canvas.requestSave();
+
+                    new Notice(`Added ${createdFiles.length} nodes to Canvas`);
+                }
+            }
+
+            new Notice(`Applied ${newInvariables.length} invariables and ${newVariables.length} variables`);
+
+            this.close();
+
+            // Refresh the file
+            const leaf = this.app.workspace.getLeaf();
+            await leaf.openFile(sourceFile);
+
+        } catch (error: any) {
+            new Notice(`Failed to apply enrichments: ${error.message}`);
+            console.error('Apply enrichments error:', error);
+        }
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// RLM Pipeline Modal - Single button: Backup → Enrich → Rebuild Canvas
+class RLMPipelineModal extends Modal {
+    plugin: BJJFlipmodePlugin;
+    canvasFile: TFile;
+    folder: TFolder;
+    checkpointFiles: TFile[];
+    selectedVideos: Set<string> = new Set();
+    catalogData: any = null;
+
+    constructor(app: App, plugin: BJJFlipmodePlugin, canvasFile: TFile, folder: TFolder, checkpointFiles: TFile[]) {
+        super(app);
+        this.plugin = plugin;
+        this.canvasFile = canvasFile;
+        this.folder = folder;
+        this.checkpointFiles = checkpointFiles;
+    }
+
+    async onOpen() {
+        const { contentEl } = this;
+
+        contentEl.createEl('h2', { text: 'RLM Pipeline: Enrich & Rebuild' });
+
+        // Pipeline steps
+        const stepsEl = contentEl.createEl('div', { cls: 'pipeline-steps' });
+        stepsEl.style.cssText = 'margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px;';
+        stepsEl.createEl('p', { text: 'This will:', cls: 'steps-header' });
+        const stepsList = stepsEl.createEl('ol');
+        stepsList.style.cssText = 'margin: 5px 0; padding-left: 25px; font-size: 0.9em;';
+        stepsList.createEl('li', { text: 'Backup current canvas (version control)' });
+        stepsList.createEl('li', { text: 'Enrich all checkpoints with selected videos' });
+        stepsList.createEl('li', { text: 'Rebuild canvas with proper layout & connections' });
+
+        // Show checkpoints found
+        const infoEl = contentEl.createEl('div', { cls: 'checkpoint-info' });
+        infoEl.style.cssText = 'margin-bottom: 15px; padding: 10px; background: var(--background-primary-alt); border-radius: 5px;';
+        infoEl.createEl('p', { text: `Found ${this.checkpointFiles.length} checkpoints in ${this.folder.name}:` });
+
+        const checkpointList = infoEl.createEl('ul');
+        checkpointList.style.cssText = 'margin: 5px 0; padding-left: 20px; font-size: 0.9em; max-height: 100px; overflow-y: auto;';
+        for (const file of this.checkpointFiles) {
+            checkpointList.createEl('li', { text: file.basename });
+        }
+
+        // Loading catalog
+        const loadingEl = contentEl.createEl('div', { text: 'Loading video catalog...' });
+        loadingEl.style.cssText = 'padding: 20px; text-align: center;';
+
+        try {
+            const response = await requestUrl({
+                url: `${this.plugin.settings.serverUrl}/api/obsidian/catalog`,
+                method: 'GET',
+                headers: { 'Authorization': `Bearer ${this.plugin.settings.apiToken}` }
+            });
+            this.catalogData = response.json;
+            loadingEl.remove();
+
+            contentEl.createEl('p', {
+                text: `Select videos to cross-reference ALL checkpoints (${this.catalogData.total_videos} available):`
+            });
+
+            // Selected count
+            const selectedCountEl = contentEl.createEl('div', { cls: 'selected-count' });
+            selectedCountEl.style.cssText = 'margin-bottom: 10px; font-weight: bold; color: var(--text-accent);';
+            selectedCountEl.textContent = '0 videos selected';
+
+            const updateCount = () => {
+                selectedCountEl.textContent = `${this.selectedVideos.size} videos selected`;
+            };
+
+            // Search filter
+            const searchEl = contentEl.createEl('input', { type: 'text', placeholder: 'Filter instructors/series...' });
+            searchEl.style.cssText = 'width: 100%; padding: 8px; margin-bottom: 10px; border-radius: 5px; border: 1px solid var(--background-modifier-border);';
+
+            // Catalog list
+            const listEl = contentEl.createEl('div', { cls: 'catalog-list' });
+            listEl.style.cssText = 'max-height: 200px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: 5px; padding: 10px;';
+
+            const renderCatalog = (filter: string = '') => {
+                listEl.empty();
+                const filterLower = filter.toLowerCase();
+
+                for (const instructor of this.catalogData.instructors) {
+                    const instructorMatches = instructor.name.toLowerCase().includes(filterLower);
+                    const matchingSeries = instructor.series.filter((s: any) =>
+                        instructorMatches || s.name.toLowerCase().includes(filterLower)
+                    );
+
+                    if (matchingSeries.length === 0 && !instructorMatches) continue;
+
+                    const groupEl = listEl.createEl('div', { cls: 'instructor-group' });
+                    groupEl.style.cssText = 'margin-bottom: 8px;';
+
+                    const headerEl = groupEl.createEl('div', { cls: 'instructor-header' });
+                    headerEl.style.cssText = 'display: flex; align-items: center; gap: 5px; cursor: pointer; padding: 3px; background: var(--background-secondary); border-radius: 3px;';
+
+                    const expandIcon = headerEl.createEl('span', { text: '>' });
+                    expandIcon.style.cssText = 'font-size: 0.8em; width: 12px;';
+
+                    const instructorCb = headerEl.createEl('input', { type: 'checkbox' }) as HTMLInputElement;
+                    headerEl.createEl('span', { text: `${instructor.name} (${instructor.video_count})` });
+
+                    const seriesContainer = groupEl.createEl('div');
+                    seriesContainer.style.cssText = 'display: none; margin-left: 20px; font-size: 0.9em;';
+
+                    headerEl.addEventListener('click', (e) => {
+                        if (e.target === instructorCb) return;
+                        const isExpanded = seriesContainer.style.display !== 'none';
+                        seriesContainer.style.display = isExpanded ? 'none' : 'block';
+                        expandIcon.textContent = isExpanded ? '>' : 'v';
+                    });
+
+                    const allVideoIds: string[] = [];
+                    const seriesToRender = instructorMatches ? instructor.series : matchingSeries;
+
+                    for (const series of seriesToRender) {
+                        const seriesEl = seriesContainer.createEl('div');
+                        seriesEl.style.cssText = 'display: flex; align-items: center; gap: 5px; padding: 2px 0;';
+
+                        const seriesCb = seriesEl.createEl('input', { type: 'checkbox' }) as HTMLInputElement;
+                        seriesEl.createEl('span', { text: `${series.name} (${series.video_count})` });
+
+                        const videoIds = series.videos.map((v: any) => v.video_id);
+                        allVideoIds.push(...videoIds);
+
+                        const allSelected = videoIds.every((id: string) => this.selectedVideos.has(id));
+                        seriesCb.checked = allSelected;
+
+                        seriesCb.addEventListener('change', () => {
+                            for (const id of videoIds) {
+                                if (seriesCb.checked) {
+                                    this.selectedVideos.add(id);
+                                } else {
+                                    this.selectedVideos.delete(id);
+                                }
+                            }
+                            updateCount();
+                        });
+                    }
+
+                    instructorCb.addEventListener('change', () => {
+                        const checkboxes = seriesContainer.querySelectorAll('input[type="checkbox"]') as NodeListOf<HTMLInputElement>;
+                        checkboxes.forEach(cb => cb.checked = instructorCb.checked);
+                        for (const id of allVideoIds) {
+                            if (instructorCb.checked) {
+                                this.selectedVideos.add(id);
+                            } else {
+                                this.selectedVideos.delete(id);
+                            }
+                        }
+                        updateCount();
+                    });
+                }
+            };
+
+            renderCatalog();
+            searchEl.addEventListener('input', () => renderCatalog(searchEl.value));
+
+            // Progress area (hidden initially)
+            const progressEl = contentEl.createEl('div', { cls: 'progress-area' });
+            progressEl.style.cssText = 'display: none; margin-top: 15px; padding: 10px; background: var(--background-primary-alt); border-radius: 5px;';
+
+            // Footer
+            const footerEl = contentEl.createEl('div', { cls: 'modal-footer' });
+            footerEl.style.cssText = 'margin-top: 15px; display: flex; gap: 10px; justify-content: flex-end;';
+
+            new Setting(footerEl)
+                .addButton(btn => btn
+                    .setButtonText('Run RLM Pipeline')
+                    .setCta()
+                    .onClick(async () => {
+                        if (this.selectedVideos.size === 0) {
+                            new Notice('Select at least one video');
+                            return;
+                        }
+
+                        btn.setButtonText('Running Pipeline...');
+                        btn.setDisabled(true);
+
+                        progressEl.style.display = 'block';
+                        progressEl.empty();
+
+                        // STEP 1: Backup Canvas
+                        progressEl.createEl('h4', { text: 'Step 1: Backing up canvas...' });
+                        const backupName = `${this.canvasFile.basename}_backup_${Date.now()}.canvas`;
+                        const backupPath = `${this.folder.path}/${backupName}`;
+                        try {
+                            const canvasContent = await this.app.vault.read(this.canvasFile);
+                            await this.app.vault.create(backupPath, canvasContent);
+                            progressEl.createEl('p', { text: `Backup saved: ${backupName}` });
+                        } catch (e) {
+                            progressEl.createEl('p', { text: 'Backup failed, continuing...' });
+                        }
+
+                        // STEP 2: Enrich all checkpoints
+                        progressEl.createEl('h4', { text: 'Step 2: Enriching checkpoints...' });
+
+                        const videoIds = Array.from(this.selectedVideos);
+                        let successCount = 0;
+                        let totalNewConcepts = 0;
+
+                        for (let i = 0; i < this.checkpointFiles.length; i++) {
+                            const file = this.checkpointFiles[i];
+                            const checkpointName = file.basename;
+
+                            const statusEl = progressEl.createEl('div');
+                            statusEl.textContent = `[${i + 1}/${this.checkpointFiles.length}] ${checkpointName}...`;
+
+                            try {
+                                // Parse checkpoint data
+                                const content = await this.app.vault.read(file);
+                                const cache = this.app.metadataCache.getFileCache(file);
+
+                                const invariablesMatch = content.match(/## INVARIABLES[\s\S]*?\|[\s\S]*?\|([\s\S]*?)(?=\n---|\n##|$)/);
+                                const currentInvariables: string[] = [];
+                                if (invariablesMatch) {
+                                    const links = invariablesMatch[1].match(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g) || [];
+                                    for (const link of links) {
+                                        const nameMatch = link.match(/\[\[(?:[^\]|]+\|)?([^\]]+)\]\]/);
+                                        if (nameMatch && nameMatch[1] !== 'none') {
+                                            currentInvariables.push(nameMatch[1].trim());
+                                        }
+                                    }
+                                }
+
+                                const variablesMatch = content.match(/## VARIABLES[\s\S]*?((?:- \*\*IF.*\n?)+)/);
+                                const currentVariables: string[] = [];
+                                if (variablesMatch) {
+                                    const lines = variablesMatch[1].match(/- \*\*IF[^*]+\*\*[^\n]+/g) || [];
+                                    currentVariables.push(...lines.map(l => l.replace(/^- /, '').trim()));
+                                }
+
+                                const goalMatch = content.match(/## Goal\n\n([^\n]+)/);
+                                const goal = goalMatch ? goalMatch[1].trim() : '';
+
+                                const successMatch = content.match(/## Success Test\n\n> ([^\n]+)/);
+                                const successTest = successMatch ? successMatch[1].trim() : '';
+
+                                // Call enrichment API
+                                const response = await requestUrl({
+                                    url: `${this.plugin.settings.serverUrl}/api/obsidian/enrich-checkpoint`,
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        'Authorization': `Bearer ${this.plugin.settings.apiToken}`
+                                    },
+                                    body: JSON.stringify({
+                                        checkpoint_name: checkpointName,
+                                        checkpoint_cluster: cache?.frontmatter?.cluster || '',
+                                        current_invariables: currentInvariables,
+                                        current_variables: currentVariables,
+                                        goal,
+                                        success_test: successTest,
+                                        video_ids: videoIds
+                                    }),
+                                    throw: false
+                                });
+
+                                if (response.status === 200) {
+                                    const enrichments = response.json;
+                                    const newCount = (enrichments.new_invariables?.length || 0) + (enrichments.new_variables?.length || 0);
+                                    totalNewConcepts += newCount;
+
+                                    // Auto-apply enrichments to markdown files
+                                    if (newCount > 0) {
+                                        await this.applyEnrichmentsToCheckpoint(file, enrichments);
+                                    }
+
+                                    statusEl.textContent = `[${i + 1}/${this.checkpointFiles.length}] ${checkpointName} - ${newCount} new concepts`;
+                                    statusEl.style.color = 'var(--text-success)';
+                                    successCount++;
+                                } else {
+                                    statusEl.textContent = `[${i + 1}/${this.checkpointFiles.length}] ${checkpointName} - Failed`;
+                                    statusEl.style.color = 'var(--text-error)';
+                                }
+                            } catch (error: any) {
+                                statusEl.textContent = `[${i + 1}/${this.checkpointFiles.length}] ${checkpointName} - Error: ${error.message}`;
+                                statusEl.style.color = 'var(--text-error)';
+                            }
+                        }
+
+                        // STEP 3: Rebuild canvas
+                        progressEl.createEl('hr');
+                        progressEl.createEl('h4', { text: 'Step 3: Rebuilding canvas...' });
+
+                        const rebuildStatus = progressEl.createEl('div');
+                        rebuildStatus.textContent = 'Scanning checkpoint files and linked concepts...';
+
+                        try {
+                            const newCanvasPath = await this.rebuildCanvasForFolder(this.folder, this.canvasFile.basename);
+                            rebuildStatus.textContent = `Canvas rebuilt: ${newCanvasPath}`;
+                            rebuildStatus.style.color = 'var(--text-success)';
+                        } catch (err: any) {
+                            rebuildStatus.textContent = `Canvas rebuild failed: ${err.message}`;
+                            rebuildStatus.style.color = 'var(--text-error)';
+                        }
+
+                        // Summary
+                        progressEl.createEl('hr');
+                        progressEl.createEl('p', {
+                            text: `Complete: ${successCount}/${this.checkpointFiles.length} checkpoints enriched, ${totalNewConcepts} new concepts added`
+                        });
+
+                        btn.setButtonText('Done');
+                        btn.setDisabled(false);
+                        btn.buttonEl.onclick = () => this.close();
+                        new Notice(`RLM Pipeline complete: ${totalNewConcepts} new concepts, canvas rebuilt`);
+                    }))
+                .addButton(btn => btn
+                    .setButtonText('Cancel')
+                    .onClick(() => this.close()));
+
+        } catch (error: any) {
+            loadingEl.textContent = `Error loading catalog: ${error.message}`;
+        }
+    }
+
+    async applyEnrichmentsToCheckpoint(file: TFile, enrichments: any) {
+        const cache = this.app.metadataCache.getFileCache(file);
+        const cluster = cache?.frontmatter?.cluster || '';
+
+        let content = await this.app.vault.read(file);
+
+        // Add new invariables (create concept files with timestamps for WebM clips)
+        if (enrichments.new_invariables?.length > 0) {
+            const tableMatch = content.match(/(## INVARIABLES[\s\S]*?\| REFINEMENT \|[^\n]*)/);
+            if (tableMatch) {
+                let newRows = '';
+                for (const inv of enrichments.new_invariables) {
+                    // Sanitize name for file path
+                    const safeName = inv.name.replace(/[\\/:*?"<>|]/g, '-').substring(0, 60);
+                    const conceptPath = `${file.parent?.path}/${safeName}.md`;
+
+                    const conceptContent = `---
+type: method
+method_type: invariable
+cluster: "${cluster}"
+tier: "${inv.tier}"
+source_instructor: "${inv.source_instructor || 'Unknown'}"
+video_id: "${inv.video_id || ''}"
+timestamp: "${inv.timestamp || ''}"
+clip_duration: 30
+enrichment_source: true
+---
+
+# ${inv.name}
+
+${inv.description || ''}
+
+## Clip Info
+- **Instructor:** ${inv.source_instructor || 'Unknown'}
+- **Timestamp:** ${inv.timestamp || 'N/A'}
+- **Video ID:** ${inv.video_id || 'N/A'}
+`;
+                    const existingFile = this.app.vault.getAbstractFileByPath(conceptPath);
+                    if (!existingFile) {
+                        await this.app.vault.create(conceptPath, conceptContent);
+                    }
+
+                    const linkText = `[[${safeName}]]`;
+                    newRows += `| ${inv.tier} | ${linkText} |\n`;
+                }
+
+                const refinementMatch = content.match(/(\| REFINEMENT \|[^\n]*\n)/);
+                if (refinementMatch) {
+                    content = content.replace(refinementMatch[1], newRows + refinementMatch[1]);
+                }
+            }
+        }
+
+        // Add new variables (also create method files for IF/THEN branches)
+        if (enrichments.new_variables?.length > 0) {
+            const variablesMatch = content.match(/(## VARIABLES \(IF\/THEN\)\n\n)([\s\S]*?)(\n---)/);
+            if (variablesMatch) {
+                let newVarText = '';
+                for (const v of enrichments.new_variables) {
+                    // Create a method file for the variable too
+                    const safeName = v.condition.replace(/^IF\s*/i, '').replace(/[\\/:*?"<>|]/g, '-').substring(0, 50);
+                    const varPath = `${file.parent?.path}/VAR - ${safeName}.md`;
+
+                    const varContent = `---
+type: method
+method_type: variable
+cluster: "${cluster}"
+condition: "${v.condition}"
+action: "${v.action}"
+source_instructor: "${v.source_instructor || 'Unknown'}"
+video_id: "${v.video_id || ''}"
+timestamp: "${v.timestamp || ''}"
+clip_duration: 30
+enrichment_source: true
+---
+
+# ${v.condition}
+
+**Action:** ${v.action}
+
+${v.description || ''}
+
+## Clip Info
+- **Instructor:** ${v.source_instructor || 'Unknown'}
+- **Timestamp:** ${v.timestamp || 'N/A'}
+- **Video ID:** ${v.video_id || 'N/A'}
+`;
+                    const existingVarFile = this.app.vault.getAbstractFileByPath(varPath);
+                    if (!existingVarFile) {
+                        await this.app.vault.create(varPath, varContent);
+                    }
+
+                    newVarText += `- **${v.condition}** → ${v.action} → [[VAR - ${safeName}]]\n`;
+                }
+                content = content.replace(
+                    variablesMatch[0],
+                    variablesMatch[1] + variablesMatch[2] + newVarText + variablesMatch[3]
+                );
+            }
+        }
+
+        // Add metadata (remove old entries first to avoid duplicates)
+        const enrichmentDate = new Date().toISOString().split('T')[0];
+
+        if (content.includes('---\n')) {
+            const parts = content.split('---');
+            if (parts.length >= 2) {
+                // Remove existing enrichment lines
+                parts[1] = parts[1]
+                    .replace(/\nlast_enriched:.*$/gm, '')
+                    .replace(/\nenrichment_sources:.*$/gm, '')
+                    .trimEnd();
+                // Add fresh enrichment data
+                parts[1] += `\nlast_enriched: ${enrichmentDate}\nenrichment_sources: ${enrichments.sources_analyzed} videos\n`;
+                content = parts.join('---');
+            }
+        }
+
+        await this.app.vault.modify(file, content);
+    }
+
+    /**
+     * Rebuild canvas from checkpoints in a folder.
+     * Creates a new canvas with proper layout and connections.
+     */
+    async rebuildCanvasForFolder(folder: TFolder, canvasBasename: string): Promise<string> {
+        // Find all checkpoint and method files in the folder
+        const checkpoints: any[] = [];
+        const methods: any[] = [];
+
+        for (const file of this.app.vault.getFiles()) {
+            // Must be markdown in same folder
+            if (file.extension !== 'md') continue;
+            if (file.parent?.path !== folder.path) continue;
+
+            const cache = this.app.metadataCache.getFileCache(file);
+            const frontmatter = cache?.frontmatter;
+
+            if (frontmatter?.type === 'checkpoint') {
+                const content = await this.app.vault.read(file);
+                const order = frontmatter?.order || parseInt(file.basename.match(/\[(\d+)\]/)?.[1] || '99');
+
+                // Extract linked invariables
+                const invariables: string[] = [];
+                const invMatch = content.match(/## INVARIABLES[\s\S]*?\|([\s\S]*?)(?=\n##|\n---)/);
+                if (invMatch) {
+                    const links = invMatch[1].match(/\[\[([^\]|]+)/g) || [];
+                    for (const link of links) {
+                        const name = link.replace('[[', '').trim();
+                        if (name && name !== 'none') {
+                            invariables.push(name);
+                        }
+                    }
+                }
+
+                // Extract navigation links
+                const navigation: string[] = [];
+                const navMatch = content.match(/## Navigation[\s\S]*?((?:\[\[[^\]]+\]\][^\n]*\n?)+)/);
+                if (navMatch) {
+                    const navLinks = navMatch[1].match(/\[\[([^\]|]+)/g) || [];
+                    for (const link of navLinks) {
+                        navigation.push(link.replace('[[', '').trim());
+                    }
+                }
+
+                checkpoints.push({
+                    file,
+                    order,
+                    cluster: frontmatter?.cluster || '',
+                    invariables,
+                    navigation
+                });
+            } else if (frontmatter?.type === 'method' || frontmatter?.type === 'concept' || frontmatter?.method_type) {
+                // Method/concept files - used to connect to checkpoints
+                methods.push({
+                    file,
+                    tier: frontmatter?.tier || frontmatter?.method_type || 'REFINEMENT',
+                    cluster: frontmatter?.cluster || ''
+                });
+            }
+        }
+
+        if (checkpoints.length === 0) {
+            throw new Error('No checkpoint files found');
+        }
+
+        // Sort checkpoints by order
+        checkpoints.sort((a, b) => a.order - b.order);
+
+        // Build canvas JSON
+        const canvasData: any = { nodes: [], edges: [] };
+
+        const checkpointWidth = 300;
+        const checkpointHeight = 150;
+        const methodWidth = 200;
+        const methodHeight = 80;
+        const horizontalGap = 400;
+        const methodOffsetX = 350;
+        const methodGap = 100;
+
+        let currentX = 100;
+        const checkpointY = 300;
+        const nodeIdMap: Map<string, string> = new Map();
+
+        for (let i = 0; i < checkpoints.length; i++) {
+            const cp = checkpoints[i];
+            const nodeId = `checkpoint-${i}`;
+            nodeIdMap.set(cp.file.basename, nodeId);
+
+            canvasData.nodes.push({
+                id: nodeId,
+                type: 'file',
+                file: cp.file.path,
+                x: currentX,
+                y: checkpointY,
+                width: checkpointWidth,
+                height: checkpointHeight,
+                color: '4'
+            });
+
+            // Add method nodes for invariables
+            let methodY = checkpointY - methodGap - methodHeight;
+            for (const invName of cp.invariables) {
+                const methodFile = methods.find(m => m.file.basename === invName);
+                if (methodFile) {
+                    const methodId = `method-${nodeIdMap.size}`;
+                    nodeIdMap.set(invName, methodId);
+
+                    // Determine color based on tier
+                    let color = '0';
+                    if (methodFile.tier === 'CRITICAL') color = '1';
+                    else if (methodFile.tier === 'IMPORTANT') color = '6';
+                    else if (methodFile.tier === 'invariable') color = '5';
+
+                    canvasData.nodes.push({
+                        id: methodId,
+                        type: 'file',
+                        file: methodFile.file.path,
+                        x: currentX + methodOffsetX,
+                        y: methodY,
+                        width: methodWidth,
+                        height: methodHeight,
+                        color
+                    });
+
+                    canvasData.edges.push({
+                        id: `edge-${canvasData.edges.length}`,
+                        fromNode: nodeId,
+                        fromSide: 'right',
+                        toNode: methodId,
+                        toSide: 'left'
+                    });
+
+                    methodY -= methodHeight + 30;
+                }
+            }
+
+            // Edge to next checkpoint
+            if (i < checkpoints.length - 1) {
+                canvasData.edges.push({
+                    id: `edge-cp-${i}`,
+                    fromNode: nodeId,
+                    fromSide: 'right',
+                    toNode: `checkpoint-${i + 1}`,
+                    toSide: 'left',
+                    color: '5'
+                });
+            }
+
+            currentX += horizontalGap;
+        }
+
+        // Add navigation edges
+        for (const cp of checkpoints) {
+            const fromId = nodeIdMap.get(cp.file.basename);
+            for (const navTarget of cp.navigation) {
+                const toId = nodeIdMap.get(navTarget);
+                if (fromId && toId && fromId !== toId) {
+                    const exists = canvasData.edges.some((e: any) =>
+                        e.fromNode === fromId && e.toNode === toId
+                    );
+                    if (!exists) {
+                        canvasData.edges.push({
+                            id: `edge-nav-${canvasData.edges.length}`,
+                            fromNode: fromId,
+                            fromSide: 'bottom',
+                            toNode: toId,
+                            toSide: 'top',
+                            color: '3'
+                        });
+                    }
+                }
+            }
+        }
+
+        // Write canvas file
+        const canvasPath = `${folder.path}/${canvasBasename} - RLM.canvas`;
+        const canvasContent = JSON.stringify(canvasData, null, 2);
+
+        const existingCanvas = this.app.vault.getAbstractFileByPath(canvasPath);
+        if (existingCanvas) {
+            await this.app.vault.modify(existingCanvas as TFile, canvasContent);
+        } else {
+            await this.app.vault.create(canvasPath, canvasContent);
+        }
+
+        // Open the new canvas
+        const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
+        if (canvasFile) {
+            await this.app.workspace.getLeaf().openFile(canvasFile as TFile);
+        }
+
+        return canvasPath;
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// Clip Browser Modal - Shows clip options with summaries from transcription
+class ClipBrowserModal extends Modal {
+    plugin: BJJFlipmodePlugin;
+    sourceFile: TFile;
+    clipData: any;
+
+    constructor(app: App, plugin: BJJFlipmodePlugin, sourceFile: TFile, clipData: any) {
+        super(app);
+        this.plugin = plugin;
+        this.sourceFile = sourceFile;
+        this.clipData = clipData;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        const { clipData, sourceFile } = this;
+
+        contentEl.createEl('h2', { text: `Clip Options: ${sourceFile.basename}` });
+
+        // Video info
+        const infoEl = contentEl.createEl('div', { cls: 'clip-info' });
+        infoEl.style.cssText = 'margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px;';
+        infoEl.createEl('p', { text: `Video: ${clipData.video_name || clipData.video_id}` });
+        infoEl.createEl('p', { text: `Instructor: ${clipData.instructor || 'Unknown'}` });
+        infoEl.createEl('p', { text: `Found ${clipData.clips?.length || 0} relevant sections` });
+
+        if (!clipData.clips || clipData.clips.length === 0) {
+            contentEl.createEl('p', { text: 'No clip options found for this concept.' });
+            return;
+        }
+
+        // Clip list
+        const listEl = contentEl.createEl('div', { cls: 'clip-list' });
+        listEl.style.cssText = 'max-height: 400px; overflow-y: auto;';
+
+        for (const clip of clipData.clips) {
+            const clipEl = listEl.createEl('div', { cls: 'clip-option' });
+            clipEl.style.cssText = 'margin-bottom: 15px; padding: 12px; background: var(--background-primary-alt); border-radius: 5px; border-left: 3px solid var(--text-accent);';
+
+            // Header with timestamp
+            const headerEl = clipEl.createEl('div', { cls: 'clip-header' });
+            headerEl.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;';
+
+            const timestampEl = headerEl.createEl('span', { cls: 'clip-timestamp' });
+            timestampEl.style.cssText = 'font-weight: bold; font-size: 1.1em; color: var(--text-accent);';
+            timestampEl.textContent = clip.timestamp || 'Unknown';
+
+            const durationEl = headerEl.createEl('span', { cls: 'clip-duration' });
+            durationEl.style.cssText = 'font-size: 0.9em; color: var(--text-muted);';
+            durationEl.textContent = `${clip.duration || 30}s`;
+
+            // Summary/description
+            const summaryEl = clipEl.createEl('div', { cls: 'clip-summary' });
+            summaryEl.style.cssText = 'margin-bottom: 10px; font-size: 0.95em;';
+            summaryEl.textContent = clip.summary || clip.description || 'No description';
+
+            // Transcript excerpt if available
+            if (clip.excerpt) {
+                const excerptEl = clipEl.createEl('div', { cls: 'clip-excerpt' });
+                excerptEl.style.cssText = 'font-size: 0.85em; color: var(--text-muted); font-style: italic; margin-bottom: 10px; padding: 8px; background: var(--background-secondary); border-radius: 3px;';
+                excerptEl.textContent = `"${clip.excerpt.substring(0, 200)}${clip.excerpt.length > 200 ? '...' : ''}"`;
+            }
+
+            // Extract button
+            const btnEl = clipEl.createEl('button', { text: 'Extract This Clip' });
+            btnEl.style.cssText = 'padding: 6px 12px; background: var(--interactive-accent); color: var(--text-on-accent); border: none; border-radius: 4px; cursor: pointer;';
+
+            btnEl.addEventListener('click', async () => {
+                btnEl.textContent = 'Extracting...';
+                btnEl.disabled = true;
+
+                // Parse timestamp to seconds
+                const parts = (clip.timestamp || '0:00').split(':').map((p: string) => parseInt(p, 10));
+                let startSeconds = 0;
+                if (parts.length === 3) {
+                    startSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+                } else if (parts.length === 2) {
+                    startSeconds = parts[0] * 60 + parts[1];
+                }
+
+                const clipPath = await this.plugin.doExtractClip(
+                    clipData.video_id,
+                    startSeconds,
+                    clip.duration || 30,
+                    `${sourceFile.basename}_${clip.timestamp?.replace(/:/g, '-') || 'clip'}`
+                );
+
+                if (clipPath) {
+                    new Notice(`Clip saved: ${clipPath}`);
+                    btnEl.textContent = 'Extracted!';
+                    btnEl.style.background = 'var(--text-success)';
+
+                    // Update the method file with clip info
+                    let content = await this.app.vault.read(sourceFile);
+                    if (!content.includes('## Extracted Clips')) {
+                        content += `\n\n## Extracted Clips\n`;
+                    }
+                    content += `- [${clip.timestamp}] ${clip.summary?.substring(0, 50) || 'Clip'} - \`${clipPath}\`\n`;
+                    await this.app.vault.modify(sourceFile, content);
+                } else {
+                    new Notice('Failed to extract clip');
+                    btnEl.textContent = 'Failed - Try Again';
+                    btnEl.disabled = false;
+                }
+            });
+        }
+
+        // Close button
+        const footerEl = contentEl.createEl('div', { cls: 'modal-footer' });
+        footerEl.style.cssText = 'margin-top: 15px; text-align: right;';
+
+        new Setting(footerEl)
+            .addButton(btn => btn
+                .setButtonText('Close')
+                .onClick(() => this.close()));
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// Linked Sources Modal - Shows sources from the parent Oracle article
+class LinkedSourcesModal extends Modal {
+    plugin: BJJFlipmodePlugin;
+    sourcesData: any;
+    sourceFile: TFile;
+
+    constructor(app: App, plugin: BJJFlipmodePlugin, sourcesData: any, sourceFile: TFile) {
+        super(app);
+        this.plugin = plugin;
+        this.sourcesData = sourcesData;
+        this.sourceFile = sourceFile;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        const { sourcesData } = this;
+
+        // Header
+        contentEl.createEl('h2', { text: `Sources for: ${sourcesData.concept}` });
+
+        // Meta info
+        const metaEl = contentEl.createEl('div', { cls: 'sources-meta' });
+        metaEl.style.cssText = 'margin-bottom: 20px; padding: 10px; background: var(--background-secondary); border-radius: 5px;';
+
+        if (sourcesData.section_matched) {
+            metaEl.createEl('p', { text: `📍 From section: "${sourcesData.section_matched}"` });
+        }
+        metaEl.createEl('p', { text: `Found ${sourcesData.total_sources} source${sourcesData.total_sources !== 1 ? 's' : ''} from your Oracle research` });
+
+        // Info callout
+        const infoEl = contentEl.createEl('div', { cls: 'info-callout' });
+        infoEl.style.cssText = 'margin-bottom: 15px; padding: 10px; background: rgba(var(--color-green-rgb), 0.1); border-left: 3px solid var(--text-success); border-radius: 3px;';
+        infoEl.createEl('p', {
+            text: '✓ These are the exact videos cited in your Training Review - not a new search.',
+            cls: 'info-text'
+        });
+
+        // Instructions
+        contentEl.createEl('p', {
+            text: 'Click any timestamp to generate a 60-second WebM clip:',
+            cls: 'sources-instructions'
+        });
+
+        // Sources list
+        const listEl = contentEl.createEl('div', { cls: 'sources-list' });
+        listEl.style.cssText = 'max-height: 400px; overflow-y: auto;';
+
+        const sources = sourcesData.sources || [];
+
+        if (sources.length === 0) {
+            listEl.createEl('p', { text: 'No linked sources found for this concept.' });
+        }
+
+        for (const source of sources) {
+            const sourceEl = listEl.createEl('div', { cls: 'source-item' });
+
+            // Relevance-based border color
+            const borderColor = source.relevance === 'high' ? 'var(--text-success)' :
+                               source.relevance === 'medium' ? 'var(--text-warning)' :
+                               'var(--text-muted)';
+            sourceEl.style.cssText = `padding: 12px; margin: 8px 0; border-radius: 5px; background: var(--background-secondary); cursor: pointer; border-left: 3px solid ${borderColor};`;
+
+            // Header row with timestamp and title
+            const headerRow = sourceEl.createEl('div', { cls: 'source-header' });
+            headerRow.style.cssText = 'display: flex; align-items: center; gap: 10px;';
+
+            // Timestamp badge
+            const timestampBadge = headerRow.createEl('span', { cls: 'timestamp-badge' });
+            timestampBadge.style.cssText = 'display: inline-block; background: var(--interactive-accent); color: white; padding: 2px 8px; border-radius: 3px; font-family: monospace;';
+            timestampBadge.textContent = source.timestamp || '0:00';
+
+            // Title
+            headerRow.createEl('strong', { text: source.video_title || 'Unknown Video' });
+
+            // Instructor line
+            const instructorEl = sourceEl.createEl('p', { cls: 'source-instructor' });
+            instructorEl.style.cssText = 'margin: 5px 0; font-size: 0.9em; color: var(--text-accent);';
+            instructorEl.textContent = `👤 ${source.instructor || 'Unknown'}`;
+
+            // Context preview
+            if (source.context) {
+                const contextEl = sourceEl.createEl('p', { cls: 'source-context' });
+                contextEl.style.cssText = 'margin-top: 5px; font-size: 0.85em; color: var(--text-muted); font-style: italic;';
+                contextEl.textContent = `"${source.context.substring(0, 150)}${source.context.length > 150 ? '...' : ''}"`;
+            }
+
+            // Click handler - generate clip
+            sourceEl.addEventListener('click', async () => {
+                timestampBadge.textContent = 'Generating...';
+                timestampBadge.style.background = 'var(--text-warning)';
+
+                const clipsFolder = `${this.sourceFile.parent?.path || this.plugin.settings.syncFolder}/clips/${source.video_id}`;
+                const clipPath = await this.plugin.generateClipOnDemand(
+                    source.video_id,
+                    source.timestamp_seconds || 0,
+                    clipsFolder
+                );
+
+                if (clipPath) {
+                    timestampBadge.textContent = 'Done!';
+                    timestampBadge.style.background = 'var(--text-success)';
+                    new Notice(`Clip saved: ${clipPath}`, 3000);
+
+                    // Open the clip
+                    const clipFile = this.app.vault.getAbstractFileByPath(clipPath);
+                    if (clipFile instanceof TFile) {
+                        await this.app.workspace.getLeaf('split').openFile(clipFile);
+                    }
+                } else {
+                    timestampBadge.textContent = 'Failed';
+                    timestampBadge.style.background = 'var(--text-error)';
+                    new Notice('Failed to generate clip', 3000);
+                }
+
+                // Reset after delay
+                setTimeout(() => {
+                    timestampBadge.textContent = source.timestamp || '0:00';
+                    timestampBadge.style.background = 'var(--interactive-accent)';
+                }, 3000);
+            });
+
+            // Hover effects
+            sourceEl.addEventListener('mouseenter', () => {
+                sourceEl.style.background = 'var(--background-modifier-hover)';
+            });
+            sourceEl.addEventListener('mouseleave', () => {
+                sourceEl.style.background = 'var(--background-secondary)';
+            });
+        }
+
+        // Footer buttons
+        const footerEl = contentEl.createEl('div', { cls: 'modal-footer' });
+        footerEl.style.cssText = 'margin-top: 20px; display: flex; gap: 10px;';
+
+        new Setting(footerEl)
+            .addButton(btn => btn
+                .setButtonText('Generate All Clips')
+                .setCta()
+                .onClick(async () => {
+                    btn.setButtonText('Generating...');
+                    btn.setDisabled(true);
+
+                    let generated = 0;
+
+                    for (const source of sources) {
+                        const clipsFolder = `${this.sourceFile.parent?.path || this.plugin.settings.syncFolder}/clips/${source.video_id}`;
+                        const clipPath = await this.plugin.generateClipOnDemand(
+                            source.video_id,
+                            source.timestamp_seconds || 0,
+                            clipsFolder
+                        );
+                        if (clipPath) generated++;
+                    }
+
+                    new Notice(`Generated ${generated}/${sources.length} clips!`, 5000);
+                    btn.setButtonText('Done!');
+
+                    setTimeout(() => this.close(), 2000);
+                }))
+            .addButton(btn => btn
+                .setButtonText('Try Semantic Search')
+                .onClick(async () => {
+                    // Fall back to semantic search
+                    this.close();
+                    new Notice('Trying semantic search...', 2000);
+
+                    try {
+                        const response = await requestUrl({
+                            url: `${this.plugin.settings.serverUrl}/api/obsidian/explore-video`,
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Authorization': `Bearer ${this.plugin.settings.apiToken}`
+                            },
+                            body: JSON.stringify({ concept: sourcesData.concept })
+                        });
+
+                        const data = response.json;
+
+                        if (!data.error) {
+                            const modal = new VideoExplorerModal(
+                                this.app,
+                                this.plugin,
+                                data,
+                                this.sourceFile
+                            );
+                            modal.open();
+                        } else {
+                            new Notice('No videos found via semantic search', 3000);
+                        }
+                    } catch (error: any) {
+                        new Notice(`Search failed: ${error.message}`, 3000);
+                    }
+                }))
+            .addButton(btn => btn
+                .setButtonText('Close')
+                .onClick(() => this.close()));
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// Video Explorer Modal - Browse video with clickable timestamps
+class VideoExplorerModal extends Modal {
+    plugin: BJJFlipmodePlugin;
+    videoData: any;
+    sourceFile: TFile;
+
+    constructor(app: App, plugin: BJJFlipmodePlugin, videoData: any, sourceFile: TFile) {
+        super(app);
+        this.plugin = plugin;
+        this.videoData = videoData;
+        this.sourceFile = sourceFile;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        const { videoData } = this;
+
+        // Header
+        contentEl.createEl('h2', { text: `Video: ${videoData.title || 'Unknown'}` });
+
+        const metaEl = contentEl.createEl('div', { cls: 'video-meta' });
+        metaEl.style.cssText = 'margin-bottom: 20px; padding: 10px; background: var(--background-secondary); border-radius: 5px;';
+        metaEl.createEl('p', { text: `Instructor: ${videoData.instructor || 'Unknown'}` });
+        metaEl.createEl('p', { text: `Video ID: ${videoData.video_id}` });
+        metaEl.createEl('p', { text: `Found ${videoData.total_techniques || 0} techniques with timestamps` });
+
+        // Instructions
+        contentEl.createEl('p', {
+            text: 'Click any timestamp to generate a 60-second WebM clip:',
+            cls: 'video-explorer-instructions'
+        });
+
+        // Techniques list
+        const listEl = contentEl.createEl('div', { cls: 'techniques-list' });
+        listEl.style.cssText = 'max-height: 400px; overflow-y: auto;';
+
+        const techniques = videoData.techniques || [];
+
+        if (techniques.length === 0) {
+            listEl.createEl('p', { text: 'No timestamped techniques found in this video.' });
+        }
+
+        for (const tech of techniques) {
+            const techEl = listEl.createEl('div', { cls: 'technique-item' });
+            techEl.style.cssText = 'padding: 12px; margin: 8px 0; border-radius: 5px; background: var(--background-secondary); cursor: pointer; border-left: 3px solid var(--interactive-accent);';
+
+            // Timestamp badge
+            const timestampBadge = techEl.createEl('span', { cls: 'timestamp-badge' });
+            timestampBadge.style.cssText = 'display: inline-block; background: var(--interactive-accent); color: white; padding: 2px 8px; border-radius: 3px; font-family: monospace; margin-right: 10px;';
+            timestampBadge.textContent = tech.timestamp || '0:00';
+
+            // Technique name
+            techEl.createEl('strong', { text: tech.name || 'Untitled' });
+
+            // Description
+            if (tech.description) {
+                const descEl = techEl.createEl('p', { cls: 'technique-description' });
+                descEl.style.cssText = 'margin-top: 5px; font-size: 0.9em; color: var(--text-muted);';
+                descEl.textContent = tech.description.substring(0, 200) + (tech.description.length > 200 ? '...' : '');
+            }
+
+            // Click handler - generate clip
+            techEl.addEventListener('click', async () => {
+                timestampBadge.textContent = 'Generating...';
+                timestampBadge.style.background = 'var(--text-warning)';
+
+                const clipsFolder = `${this.sourceFile.parent?.path || this.plugin.settings.syncFolder}/clips/${this.videoData.video_id}`;
+                const clipPath = await this.plugin.generateClipOnDemand(
+                    videoData.video_id,
+                    tech.timestamp_seconds || 0,
+                    clipsFolder
+                );
+
+                if (clipPath) {
+                    timestampBadge.textContent = 'Done!';
+                    timestampBadge.style.background = 'var(--text-success)';
+                    new Notice(`Clip saved: ${clipPath}`, 3000);
+
+                    // Open the clip
+                    const clipFile = this.app.vault.getAbstractFileByPath(clipPath);
+                    if (clipFile instanceof TFile) {
+                        await this.app.workspace.getLeaf('split').openFile(clipFile);
+                    }
+                } else {
+                    timestampBadge.textContent = 'Failed';
+                    timestampBadge.style.background = 'var(--text-error)';
+                    new Notice('Failed to generate clip', 3000);
+                }
+
+                // Reset after delay
+                setTimeout(() => {
+                    timestampBadge.textContent = tech.timestamp || '0:00';
+                    timestampBadge.style.background = 'var(--interactive-accent)';
+                }, 3000);
+            });
+
+            // Hover effects
+            techEl.addEventListener('mouseenter', () => {
+                techEl.style.background = 'var(--background-modifier-hover)';
+            });
+            techEl.addEventListener('mouseleave', () => {
+                techEl.style.background = 'var(--background-secondary)';
+            });
+        }
+
+        // Footer buttons
+        const footerEl = contentEl.createEl('div', { cls: 'modal-footer' });
+        footerEl.style.cssText = 'margin-top: 20px; display: flex; gap: 10px;';
+
+        new Setting(footerEl)
+            .addButton(btn => btn
+                .setButtonText('Expand to Full Series')
+                .onClick(async () => {
+                    btn.setButtonText('Loading...');
+                    btn.setDisabled(true);
+
+                    try {
+                        // Get series data
+                        const response = await requestUrl({
+                            url: `${this.plugin.settings.serverUrl}/api/obsidian/explore-series`,
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Authorization': `Bearer ${this.plugin.settings.apiToken}`
+                            },
+                            body: JSON.stringify({
+                                concept: this.videoData.concept_searched || this.videoData.title,
+                                instructor: this.videoData.instructor
+                            })
+                        });
+
+                        const seriesData = response.json;
+
+                        if (seriesData.error) {
+                            new Notice('No series found', 3000);
+                            btn.setButtonText('Expand to Full Series');
+                            btn.setDisabled(false);
+                            return;
+                        }
+
+                        // Close this modal and open Series Explorer
+                        this.close();
+                        const seriesModal = new SeriesExplorerModal(
+                            this.app,
+                            this.plugin,
+                            seriesData,
+                            this.sourceFile
+                        );
+                        seriesModal.open();
+
+                    } catch (error: any) {
+                        new Notice(`Failed to load series: ${error.message}`, 3000);
+                        btn.setButtonText('Expand to Full Series');
+                        btn.setDisabled(false);
+                    }
+                }))
+            .addButton(btn => btn
+                .setButtonText('Generate All Clips')
+                .setCta()
+                .onClick(async () => {
+                    btn.setButtonText('Generating...');
+                    btn.setDisabled(true);
+
+                    const clipsFolder = `${this.sourceFile.parent?.path || this.plugin.settings.syncFolder}/clips/${this.videoData.video_id}`;
+                    let generated = 0;
+
+                    for (const tech of techniques) {
+                        const clipPath = await this.plugin.generateClipOnDemand(
+                            videoData.video_id,
+                            tech.timestamp_seconds || 0,
+                            clipsFolder
+                        );
+                        if (clipPath) generated++;
+                    }
+
+                    new Notice(`Generated ${generated}/${techniques.length} clips!`, 5000);
+                    btn.setButtonText('Done!');
+
+                    setTimeout(() => this.close(), 2000);
+                }))
+            .addButton(btn => btn
+                .setButtonText('Close')
+                .onClick(() => this.close()));
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// Series Explorer Modal - Browse entire video series with all volumes
+class SeriesExplorerModal extends Modal {
+    plugin: BJJFlipmodePlugin;
+    seriesData: any;
+    sourceFile: TFile;
+
+    constructor(app: App, plugin: BJJFlipmodePlugin, seriesData: any, sourceFile: TFile) {
+        super(app);
+        this.plugin = plugin;
+        this.seriesData = seriesData;
+        this.sourceFile = sourceFile;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        const { seriesData } = this;
+
+        // Header
+        contentEl.createEl('h2', { text: `Series: ${seriesData.series_name || 'Unknown'}` });
+
+        const metaEl = contentEl.createEl('div', { cls: 'series-meta' });
+        metaEl.style.cssText = 'margin-bottom: 20px; padding: 10px; background: var(--background-secondary); border-radius: 5px;';
+        metaEl.createEl('p', { text: `Instructor: ${seriesData.instructor || 'Unknown'}` });
+        metaEl.createEl('p', { text: `Total Volumes: ${seriesData.total_volumes || 0}` });
+
+        // Volumes accordion
+        const volumesEl = contentEl.createEl('div', { cls: 'volumes-list' });
+        volumesEl.style.cssText = 'max-height: 500px; overflow-y: auto;';
+
+        const volumes = seriesData.volumes || [];
+
+        for (const vol of volumes) {
+            // Volume header (collapsible)
+            const volContainer = volumesEl.createEl('div', { cls: 'volume-container' });
+            volContainer.style.cssText = 'margin-bottom: 10px; border: 1px solid var(--background-modifier-border); border-radius: 5px;';
+
+            const volHeader = volContainer.createEl('div', { cls: 'volume-header' });
+            volHeader.style.cssText = 'padding: 12px; background: var(--interactive-accent); color: white; cursor: pointer; border-radius: 5px 5px 0 0; display: flex; justify-content: space-between; align-items: center;';
+
+            volHeader.createEl('strong', { text: `Volume ${vol.volume}: ${vol.title || ''}` });
+
+            const techCount = volHeader.createEl('span');
+            techCount.textContent = `${vol.total_techniques || 0} techniques`;
+            techCount.style.cssText = 'font-size: 0.85em; opacity: 0.9;';
+
+            // Techniques list (hidden by default)
+            const techList = volContainer.createEl('div', { cls: 'technique-list' });
+            techList.style.cssText = 'display: none; padding: 10px; background: var(--background-primary);';
+
+            // Toggle visibility
+            volHeader.addEventListener('click', () => {
+                const isVisible = techList.style.display !== 'none';
+                techList.style.display = isVisible ? 'none' : 'block';
+                volHeader.style.borderRadius = isVisible ? '5px 5px 0 0' : '5px';
+            });
+
+            // Add techniques
+            for (const tech of (vol.techniques || [])) {
+                const techEl = techList.createEl('div', { cls: 'technique-item' });
+                techEl.style.cssText = 'padding: 8px; margin: 4px 0; border-radius: 3px; background: var(--background-secondary); cursor: pointer; border-left: 3px solid var(--text-accent);';
+
+                const timestampBadge = techEl.createEl('span');
+                timestampBadge.style.cssText = 'display: inline-block; background: var(--text-accent); color: white; padding: 2px 6px; border-radius: 3px; font-family: monospace; font-size: 0.85em; margin-right: 8px;';
+                timestampBadge.textContent = tech.timestamp || '0:00';
+
+                techEl.createEl('span', { text: tech.name || 'Untitled' });
+
+                // Click to generate clip
+                techEl.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    timestampBadge.textContent = '...';
+                    timestampBadge.style.background = 'var(--text-warning)';
+
+                    const clipsFolder = `${this.sourceFile.parent?.path || this.plugin.settings.syncFolder}/clips/${vol.video_id}`;
+                    const clipPath = await this.plugin.generateClipOnDemand(
+                        vol.video_id,
+                        tech.timestamp_seconds || 0,
+                        clipsFolder
+                    );
+
+                    if (clipPath) {
+                        timestampBadge.textContent = 'OK';
+                        timestampBadge.style.background = 'var(--text-success)';
+                        new Notice(`Clip saved!`, 2000);
+                    } else {
+                        timestampBadge.textContent = 'X';
+                        timestampBadge.style.background = 'var(--text-error)';
+                    }
+
+                    setTimeout(() => {
+                        timestampBadge.textContent = tech.timestamp || '0:00';
+                        timestampBadge.style.background = 'var(--text-accent)';
+                    }, 2000);
+                });
+
+                techEl.addEventListener('mouseenter', () => techEl.style.background = 'var(--background-modifier-hover)');
+                techEl.addEventListener('mouseleave', () => techEl.style.background = 'var(--background-secondary)');
+            }
+        }
+
+        // Footer
+        new Setting(contentEl)
+            .addButton(btn => btn
+                .setButtonText('Close')
+                .onClick(() => this.close()));
     }
 
     onClose() {
@@ -5396,7 +9916,7 @@ class BJJFlipmodeSettingTab extends PluginSettingTab {
         // Mode selection
         new Setting(containerEl)
             .setName('Mode')
-            .setDesc('Local: Direct Oracle. Remote: Athlete sending to coach. Coach: Process athlete queries.')
+            .setDesc('Local: Direct Oracle. Remote: Athlete sending to Oracle. Coach: Process athlete queries.')
             .addDropdown(dropdown => dropdown
                 .addOption('local', 'Local (Direct Oracle)')
                 .addOption('remote', 'Remote (Athlete)')
@@ -5512,7 +10032,7 @@ class BJJFlipmodeSettingTab extends PluginSettingTab {
             // Queue Service URL
             new Setting(containerEl)
                 .setName('Queue Service URL')
-                .setDesc('URL of the coach queue service (e.g., https://your-app.herokuapp.com)')
+                .setDesc('URL of the Oracle queue service (e.g., https://your-app.herokuapp.com)')
                 .addText(text => text
                     .setPlaceholder('https://flipmode-queue.herokuapp.com')
                     .setValue(this.plugin.settings.queueServiceUrl)
@@ -5524,7 +10044,7 @@ class BJJFlipmodeSettingTab extends PluginSettingTab {
             // Connect with Discord
             new Setting(containerEl)
                 .setName('Connect with Discord')
-                .setDesc('Authenticate with your coach via Discord')
+                .setDesc('Authenticate via Discord to connect with Oracle')
                 .addButton(btn => btn
                     .setButtonText('Connect Discord')
                     .setCta()
@@ -5567,7 +10087,7 @@ class BJJFlipmodeSettingTab extends PluginSettingTab {
             // Test Queue Connection
             new Setting(containerEl)
                 .setName('Test Queue Connection')
-                .setDesc('Verify connection to coach queue')
+                .setDesc('Verify connection to Oracle queue')
                 .addButton(btn => btn
                     .setButtonText('Test')
                     .onClick(async () => {
@@ -5592,7 +10112,7 @@ class BJJFlipmodeSettingTab extends PluginSettingTab {
             // View Pending Jobs
             new Setting(containerEl)
                 .setName('Pending Queries')
-                .setDesc('View your pending coach queries')
+                .setDesc('View your pending Oracle queries')
                 .addButton(btn => btn
                     .setButtonText('View Jobs')
                     .onClick(() => {
@@ -5602,7 +10122,7 @@ class BJJFlipmodeSettingTab extends PluginSettingTab {
             // Sync Graph to Coach
             new Setting(containerEl)
                 .setName('Sync Graph')
-                .setDesc('Send your research graph to your coach')
+                .setDesc('Send your research graph to Oracle')
                 .addButton(btn => btn
                     .setButtonText('Sync Now')
                     .onClick(async () => {
@@ -5713,6 +10233,18 @@ class BJJFlipmodeSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.syncFolder)
                 .onChange(async (value) => {
                     this.plugin.settings.syncFolder = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Concepts Subfolder
+        new Setting(containerEl)
+            .setName('Concepts Subfolder')
+            .setDesc('Subfolder for concept graphs (e.g., "concepts" → {syncFolder}/concepts/{topic}/)')
+            .addText(text => text
+                .setPlaceholder('concepts')
+                .setValue(this.plugin.settings.conceptsSubfolder)
+                .onChange(async (value) => {
+                    this.plugin.settings.conceptsSubfolder = value || 'concepts';
                     await this.plugin.saveSettings();
                 }));
 
