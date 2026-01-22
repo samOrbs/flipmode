@@ -53,7 +53,9 @@ var DEFAULT_SETTINGS = {
   // Athlete identity
   athleteName: "Athlete",
   // Concepts folder structure
-  conceptsSubfolder: "concepts"
+  conceptsSubfolder: "concepts",
+  // Shared canvases
+  sharedCanvases: {}
 };
 var RemoteQueueClient = class {
   constructor(baseUrl, token) {
@@ -147,6 +149,17 @@ var RemoteQueueClient = class {
     } catch (e) {
       return false;
     }
+  }
+  async getCanvases(since) {
+    const url = since ? `${this.baseUrl}/api/queue/canvases?since=${encodeURIComponent(since)}` : `${this.baseUrl}/api/queue/canvases`;
+    const response = await (0, import_obsidian.requestUrl)({
+      url,
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${this.token}`
+      }
+    });
+    return response.json.canvases || {};
   }
 };
 var CoachQueueClient = class {
@@ -269,6 +282,22 @@ var CoachQueueClient = class {
     });
     return response.json;
   }
+  async syncCanvas(athleteId, canvasName, canvasData) {
+    const response = await (0, import_obsidian.requestUrl)({
+      url: `${this.baseUrl}/api/coach/sync-canvas`,
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${this.token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        athlete_id: athleteId,
+        canvas_name: canvasName,
+        canvas_data: canvasData
+      })
+    });
+    return response.json;
+  }
 };
 var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
   constructor() {
@@ -280,6 +309,9 @@ var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
     this.queueClient = null;
     // Coach mode
     this.coachClient = null;
+    // Track last canvas sync time
+    this.lastCanvasSync = null;
+    this.canvasPollIntervalId = null;
   }
   async onload() {
     await this.loadSettings();
@@ -424,6 +456,35 @@ var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
         return false;
       }
     });
+    this.addCommand({
+      id: "flipmode-generate-variables-canvas",
+      name: "Generate Variables Canvas",
+      checkCallback: (checking) => {
+        const canvasView = this.app.workspace.getActiveViewOfType(import_obsidian.ItemView);
+        if (canvasView && canvasView.getViewType() === "canvas") {
+          if (!checking) {
+            this.generateVariablesCanvas(canvasView);
+          }
+          return true;
+        }
+        return false;
+      }
+    });
+    this.addCommand({
+      id: "flipmode-toggle-canvas",
+      name: "Toggle RLM/Variables Canvas",
+      hotkeys: [{ modifiers: ["Ctrl", "Shift"], key: "v" }],
+      checkCallback: (checking) => {
+        const canvasView = this.app.workspace.getActiveViewOfType(import_obsidian.ItemView);
+        if (canvasView && canvasView.getViewType() === "canvas") {
+          if (!checking) {
+            this.toggleRLMVariablesCanvas(canvasView);
+          }
+          return true;
+        }
+        return false;
+      }
+    });
     this.addSettingTab(new BJJFlipmodeSettingTab(this.app, this));
     this.registerEvent(
       this.app.workspace.on("editor-menu", (menu, editor, view) => {
@@ -495,10 +556,17 @@ var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
               });
             });
           }
-          if (((_c = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _c.type) === "method" && cache.frontmatter.timestamp) {
+          if ((_c = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _c.video_id) {
+            if (cache.frontmatter.timestamp) {
+              menu.addItem((item) => {
+                item.setTitle(`Extract Clip at ${cache.frontmatter.timestamp}`).setIcon("video").onClick(async () => {
+                  await this.extractClipDirect(node, cache.frontmatter);
+                });
+              });
+            }
             menu.addItem((item) => {
-              item.setTitle("Extract WebM Clip").setIcon("video").onClick(async () => {
-                await this.extractClipFromMethod(node.file, cache.frontmatter);
+              item.setTitle("Browse All Timestamps").setIcon("list").onClick(async () => {
+                await this.openConceptCacheForClips(node, cache.frontmatter);
               });
             });
           }
@@ -506,16 +574,74 @@ var BJJFlipmodePlugin = class extends import_obsidian.Plugin {
       })
     );
     this.registerEvent(
+      this.app.workspace.on("canvas:menu", (menu, canvas) => {
+        var _a;
+        if (this.settings.mode !== "coach" || !this.coachClient)
+          return;
+        const canvasView = this.app.workspace.getActiveViewOfType(import_obsidian.ItemView);
+        if (!canvasView || canvasView.getViewType() !== "canvas")
+          return;
+        const canvasFile = canvasView.file;
+        if (!canvasFile)
+          return;
+        const isShared = ((_a = this.settings.sharedCanvases[canvasFile.path]) == null ? void 0 : _a.length) > 0;
+        menu.addItem((item) => {
+          item.setTitle(isShared ? "Update Shared Canvas" : "Share Canvas with Athlete").setIcon("send").onClick(async () => {
+            await this.shareCanvasWithAthlete(canvasFile);
+          });
+        });
+        if (isShared) {
+          menu.addItem((item) => {
+            item.setTitle("Stop Sharing Canvas").setIcon("x").onClick(async () => {
+              delete this.settings.sharedCanvases[canvasFile.path];
+              await this.saveSettings();
+              new import_obsidian.Notice("Canvas unshared");
+            });
+          });
+        }
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("modify", async (file) => {
+        if (!(file instanceof import_obsidian.TFile))
+          return;
+        if (file.extension !== "canvas")
+          return;
+        if (this.settings.mode !== "coach" || !this.coachClient)
+          return;
+        const sharedWith = this.settings.sharedCanvases[file.path];
+        if (!sharedWith || sharedWith.length === 0)
+          return;
+        if (this._canvasSyncTimeout) {
+          clearTimeout(this._canvasSyncTimeout);
+        }
+        this._canvasSyncTimeout = setTimeout(async () => {
+          await this.syncSharedCanvas(file, sharedWith);
+        }, 2e3);
+      })
+    );
+    this.registerEvent(
       this.app.workspace.on("file-menu", (menu, file) => {
+        var _a;
         if (!(file instanceof import_obsidian.TFile))
           return;
         if (file.extension === "canvas") {
           if (this.settings.mode === "coach" && this.coachClient) {
+            const isShared = ((_a = this.settings.sharedCanvases[file.path]) == null ? void 0 : _a.length) > 0;
             menu.addItem((item) => {
-              item.setTitle("Share Canvas with Athlete").setIcon("send").onClick(async () => {
+              item.setTitle(isShared ? "Update Shared Canvas" : "Share Canvas with Athlete").setIcon("send").onClick(async () => {
                 await this.shareCanvasWithAthlete(file);
               });
             });
+            if (isShared) {
+              menu.addItem((item) => {
+                item.setTitle("Stop Sharing").setIcon("x").onClick(async () => {
+                  delete this.settings.sharedCanvases[file.path];
+                  await this.saveSettings();
+                  new import_obsidian.Notice("Canvas unshared");
+                });
+              });
+            }
           }
           return;
         }
@@ -805,7 +931,14 @@ ${job.query_text}
             }
           );
           if (result.success) {
-            new import_obsidian.Notice(`Shared with ${selectedAthlete.display_name || selectedAthlete.discord_username}!`);
+            if (!this.settings.sharedCanvases[file.path]) {
+              this.settings.sharedCanvases[file.path] = [];
+            }
+            if (!this.settings.sharedCanvases[file.path].includes(selectedAthlete.id)) {
+              this.settings.sharedCanvases[file.path].push(selectedAthlete.id);
+            }
+            await this.saveSettings();
+            new import_obsidian.Notice(`Shared with ${selectedAthlete.display_name || selectedAthlete.discord_username}! Changes will auto-sync.`);
           } else {
             new import_obsidian.Notice(`Saved but Discord notification failed: ${result.message}`);
           }
@@ -817,6 +950,40 @@ ${job.query_text}
     } catch (error) {
       new import_obsidian.Notice(`Failed to get athletes: ${error.message}`);
     }
+  }
+  /**
+   * Sync a shared canvas to all athletes it's shared with.
+   * Called automatically when a shared canvas is modified.
+   */
+  async syncSharedCanvas(file, athleteIds) {
+    if (!this.coachClient)
+      return;
+    const content = await this.app.vault.read(file);
+    let canvasData;
+    try {
+      canvasData = JSON.parse(content);
+    } catch (e) {
+      return;
+    }
+    const canvasName = file.basename;
+    for (const athleteId of athleteIds) {
+      try {
+        await this.coachClient.syncCanvas(
+          athleteId,
+          canvasName,
+          {
+            type: "canvas",
+            canvasName,
+            nodes: canvasData.nodes || [],
+            edges: canvasData.edges || [],
+            updatedAt: Date.now()
+          }
+        );
+      } catch (error) {
+        console.error(`Failed to sync canvas to athlete ${athleteId}:`, error);
+      }
+    }
+    new import_obsidian.Notice(`Canvas synced to ${athleteIds.length} athlete(s)`);
   }
   /**
    * Extract WebM video clips from a Training Review article and create a Canvas with embedded clips.
@@ -1471,6 +1638,82 @@ ${video.relevance_quote || ""}`,
     }
   }
   /**
+   * Generate Variables canvas from current canvas folder.
+   */
+  async generateVariablesCanvas(canvasView) {
+    try {
+      const canvasFile = canvasView.file;
+      if (!canvasFile) {
+        new import_obsidian.Notice("Could not determine canvas file");
+        return;
+      }
+      const parentFolder = canvasFile.parent;
+      if (!parentFolder) {
+        new import_obsidian.Notice("Could not determine folder");
+        return;
+      }
+      const canvasBasename = canvasFile.basename.replace(/ - RLM$/, "").replace(/ - Variables$/, "");
+      const subfolderPath = `${parentFolder.path}/${canvasBasename}`;
+      const subfolder = this.app.vault.getAbstractFileByPath(subfolderPath);
+      const targetFolderPath = subfolder && subfolder instanceof import_obsidian.TFolder ? subfolderPath : parentFolder.path;
+      const targetFolder = this.app.vault.getAbstractFileByPath(targetFolderPath);
+      new import_obsidian.Notice("Generating Variables canvas...");
+      const tempModal = new RLMPipelineModal(this.app, this, canvasFile, targetFolder, []);
+      const variablesPath = await tempModal.generateVariablesCanvasOnly(targetFolder, canvasBasename);
+      new import_obsidian.Notice(`Variables canvas created: ${variablesPath}`);
+      const varCanvasFile = this.app.vault.getAbstractFileByPath(variablesPath);
+      if (varCanvasFile) {
+        await this.app.workspace.getLeaf().openFile(varCanvasFile);
+      }
+    } catch (error) {
+      new import_obsidian.Notice(`Error: ${error.message}`);
+      console.error("Generate variables canvas error:", error);
+    }
+  }
+  /**
+   * Toggle between RLM and Variables canvas.
+   */
+  async toggleRLMVariablesCanvas(canvasView) {
+    var _a;
+    try {
+      const canvasFile = canvasView.file;
+      if (!canvasFile) {
+        new import_obsidian.Notice("Could not determine canvas file");
+        return;
+      }
+      const currentName = canvasFile.basename;
+      const folderPath = ((_a = canvasFile.parent) == null ? void 0 : _a.path) || "";
+      let targetPath;
+      if (currentName.endsWith(" - RLM")) {
+        const baseName = currentName.replace(/ - RLM$/, "");
+        targetPath = `${folderPath}/${baseName} - Variables.canvas`;
+      } else if (currentName.endsWith(" - Variables")) {
+        const baseName = currentName.replace(/ - Variables$/, "");
+        targetPath = `${folderPath}/${baseName} - RLM.canvas`;
+      } else {
+        const rlmPath = `${folderPath}/${currentName} - RLM.canvas`;
+        const varPath = `${folderPath}/${currentName} - Variables.canvas`;
+        if (this.app.vault.getAbstractFileByPath(rlmPath)) {
+          targetPath = rlmPath;
+        } else if (this.app.vault.getAbstractFileByPath(varPath)) {
+          targetPath = varPath;
+        } else {
+          new import_obsidian.Notice("No RLM or Variables canvas found");
+          return;
+        }
+      }
+      const targetFile = this.app.vault.getAbstractFileByPath(targetPath);
+      if (targetFile && targetFile instanceof import_obsidian.TFile) {
+        await this.app.workspace.getLeaf().openFile(targetFile);
+      } else {
+        new import_obsidian.Notice(`Canvas not found: ${targetPath}`);
+      }
+    } catch (error) {
+      new import_obsidian.Notice(`Error: ${error.message}`);
+      console.error("Toggle canvas error:", error);
+    }
+  }
+  /**
    * Rebuild Canvas from checkpoint files - proper layout with all connections.
    * This regenerates the entire canvas from the enriched markdown files.
    */
@@ -1693,7 +1936,196 @@ ${video.relevance_quote || ""}`,
   /**
    * Actually extract a WebM clip after user selects it.
    */
-  async doExtractClip(videoId, startTime, duration, outputName) {
+  /**
+   * Fetch a 60s clip and attach it as a new node on the canvas.
+   */
+  async fetchClipAndAttachNode(node, frontmatter) {
+    var _a;
+    const { video_id, timestamp } = frontmatter;
+    const file = node.file;
+    if (!video_id) {
+      new import_obsidian.Notice("No video_id in frontmatter");
+      return;
+    }
+    let startSeconds = 0;
+    if (timestamp) {
+      const parts = timestamp.split(":").map((p) => parseInt(p, 10));
+      if (parts.length === 3) {
+        startSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+      } else if (parts.length === 2) {
+        startSeconds = parts[0] * 60 + parts[1];
+      }
+    }
+    new import_obsidian.Notice(`Fetching 60s clip from ${timestamp || "0:00"}...`);
+    try {
+      const parentPath = ((_a = file.parent) == null ? void 0 : _a.path) || "";
+      const vaultFolder = `${parentPath}/clips`;
+      const clipName = `${file.basename}_clip_${(timestamp == null ? void 0 : timestamp.replace(/:/g, "-")) || "start"}`;
+      const clipPath = await this.doExtractClip(video_id, startSeconds, 60, clipName, vaultFolder);
+      if (!clipPath) {
+        new import_obsidian.Notice("Failed to extract clip");
+        return;
+      }
+      new import_obsidian.Notice(`Clip extracted: ${clipPath}`);
+      const canvasView = this.app.workspace.getActiveViewOfType(import_obsidian.ItemView);
+      if (!canvasView || canvasView.getViewType() !== "canvas") {
+        new import_obsidian.Notice("Canvas not active - clip saved but node not added");
+        return;
+      }
+      const canvas = canvasView.canvas;
+      if (!canvas) {
+        new import_obsidian.Notice("Could not access canvas");
+        return;
+      }
+      const clipFile = this.app.vault.getAbstractFileByPath(clipPath);
+      if (clipFile && clipFile instanceof import_obsidian.TFile) {
+        const newNode = canvas.createFileNode({
+          file: clipFile,
+          pos: {
+            x: node.x + node.width + 50,
+            y: node.y
+          },
+          size: {
+            width: 320,
+            height: 240
+          }
+        });
+        try {
+          if (canvas.createEdge) {
+            canvas.createEdge({
+              fromNode: node,
+              fromSide: "right",
+              toNode: newNode,
+              toSide: "left"
+            });
+          }
+        } catch (e) {
+        }
+        canvas.requestSave();
+        new import_obsidian.Notice(`Clip node added to canvas`);
+      } else {
+        new import_obsidian.Notice(`Clip saved at ${clipPath} but file not found in vault`);
+      }
+    } catch (error) {
+      new import_obsidian.Notice(`Error: ${error.message}`);
+      console.error("Fetch clip error:", error);
+    }
+  }
+  /**
+   * Extract clip directly at the timestamp specified in frontmatter.
+   * Adds the clip as a new canvas node.
+   */
+  async extractClipDirect(node, frontmatter) {
+    var _a;
+    const { video_id, timestamp } = frontmatter;
+    const file = node.file;
+    if (!video_id) {
+      new import_obsidian.Notice("No video_id in frontmatter");
+      return;
+    }
+    if (!timestamp) {
+      new import_obsidian.Notice("No timestamp in frontmatter");
+      return;
+    }
+    const parts = timestamp.split(":").map((p) => parseInt(p, 10));
+    let startSeconds = 0;
+    if (parts.length === 3) {
+      startSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    } else if (parts.length === 2) {
+      startSeconds = parts[0] * 60 + parts[1];
+    }
+    new import_obsidian.Notice(`Extracting 2min clip at ${timestamp}...`);
+    try {
+      const parentPath = ((_a = file.parent) == null ? void 0 : _a.path) || "";
+      const vaultFolder = `${parentPath}/clips`;
+      const safeName = `${file.basename}_${timestamp.replace(/:/g, "-")}`;
+      const clipPath = await this.doExtractClip(video_id, startSeconds, 120, safeName, vaultFolder);
+      if (!clipPath) {
+        new import_obsidian.Notice("Failed to extract clip");
+        return;
+      }
+      new import_obsidian.Notice(`Clip extracted: ${clipPath}`);
+      const canvasView = this.app.workspace.getActiveViewOfType(import_obsidian.ItemView);
+      if (!canvasView || canvasView.getViewType() !== "canvas") {
+        new import_obsidian.Notice("Canvas not active - clip saved but node not added");
+        return;
+      }
+      const canvas = canvasView.canvas;
+      if (!canvas) {
+        new import_obsidian.Notice("Could not access canvas");
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const clipFile = this.app.vault.getAbstractFileByPath(clipPath);
+      if (clipFile && clipFile instanceof import_obsidian.TFile) {
+        const clipNode = canvas.createFileNode({
+          file: clipFile,
+          pos: {
+            x: node.x + node.width + 30,
+            y: node.y + 20
+          },
+          size: {
+            width: 200,
+            height: 150
+          }
+        });
+        if (clipNode) {
+          canvas.addEdge({
+            fromNode: node,
+            fromSide: "right",
+            toNode: clipNode,
+            toSide: "left"
+          });
+        }
+        canvas.requestSave();
+        new import_obsidian.Notice(`Clip linked at ${timestamp}`);
+      } else {
+        new import_obsidian.Notice(`Clip saved but not found in vault: ${clipPath}`);
+      }
+    } catch (error) {
+      new import_obsidian.Notice(`Error: ${error.message}`);
+      console.error("Extract clip error:", error);
+    }
+  }
+  /**
+   * Open Concept Cache viewer with clickable timestamps for clip extraction.
+   * Clicking a timestamp extracts a clip and adds it as a canvas node.
+   */
+  async openConceptCacheForClips(node, frontmatter) {
+    const { video_id } = frontmatter;
+    const file = node.file;
+    if (!video_id) {
+      new import_obsidian.Notice("No video_id in frontmatter");
+      return;
+    }
+    new import_obsidian.Notice(`Loading concept cache for ${video_id}...`);
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.settings.serverUrl}/api/obsidian/concept-cache/${video_id}`,
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${this.settings.apiToken}`
+        }
+      });
+      const data = response.json;
+      if (data.error) {
+        new import_obsidian.Notice(`Error: ${data.error}`);
+        return;
+      }
+      const modal = new ConceptCacheClipsModal(
+        this.app,
+        this,
+        node,
+        file,
+        data
+      );
+      modal.open();
+    } catch (error) {
+      new import_obsidian.Notice(`Error loading concept cache: ${error.message}`);
+      console.error("Concept cache error:", error);
+    }
+  }
+  async doExtractClip(videoId, startTime, duration, outputName, vaultFolder) {
     try {
       const response = await (0, import_obsidian.requestUrl)({
         url: `${this.settings.serverUrl}/api/obsidian/extract-clip`,
@@ -1706,7 +2138,8 @@ ${video.relevance_quote || ""}`,
           video_id: videoId,
           start_time: startTime,
           duration,
-          output_name: outputName
+          output_name: outputName,
+          vault_folder: vaultFolder || ""
         })
       });
       const data = response.json;
@@ -2139,7 +2572,50 @@ ${article}`;
       this.settings.athleteToken
     );
     this.startResultPolling();
+    this.startCanvasPolling();
     this.updateStatusBar("Remote Mode");
+  }
+  startCanvasPolling() {
+    if (this.canvasPollIntervalId) {
+      window.clearInterval(this.canvasPollIntervalId);
+    }
+    this.canvasPollIntervalId = window.setInterval(
+      () => this.pollCanvasUpdates(),
+      3e4
+    );
+    this.pollCanvasUpdates();
+  }
+  async pollCanvasUpdates() {
+    if (!this.queueClient)
+      return;
+    try {
+      const canvases = await this.queueClient.getCanvases(this.lastCanvasSync || void 0);
+      if (Object.keys(canvases).length === 0)
+        return;
+      for (const [canvasName, canvasInfo] of Object.entries(canvases)) {
+        await this.syncCanvasToVault(canvasName, canvasInfo.data);
+      }
+      this.lastCanvasSync = new Date().toISOString();
+      new import_obsidian.Notice(`Synced ${Object.keys(canvases).length} canvas update(s) from coach`);
+    } catch (error) {
+      console.error("Canvas poll error:", error);
+    }
+  }
+  async syncCanvasToVault(canvasName, canvasData) {
+    const coachFolder = `${this.settings.syncFolder}/Coach`;
+    await this.ensureFolder(coachFolder);
+    const canvasPath = `${coachFolder}/${canvasName}.canvas`;
+    const canvasContent = JSON.stringify({
+      nodes: canvasData.nodes || [],
+      edges: canvasData.edges || []
+    }, null, 2);
+    const existingFile = this.app.vault.getAbstractFileByPath(canvasPath);
+    if (existingFile && existingFile instanceof import_obsidian.TFile) {
+      await this.app.vault.modify(existingFile, canvasContent);
+    } else {
+      await this.app.vault.create(canvasPath, canvasContent);
+    }
+    console.log(`[Canvas Sync] Saved ${canvasName} to ${canvasPath}`);
   }
   startResultPolling() {
     if (this.pollIntervalId) {
@@ -2295,6 +2771,9 @@ This note will be updated when results are ready.
     }
     if (this.pollIntervalId) {
       window.clearInterval(this.pollIntervalId);
+    }
+    if (this.canvasPollIntervalId) {
+      window.clearInterval(this.canvasPollIntervalId);
     }
   }
   async syncFromCoach() {
@@ -6977,6 +7456,17 @@ enrichment_sources: ${enrichments.sources_analyzed} videos
             }
           }
         }
+        const variables = [];
+        const varMatch = content.match(/## VARIABLES[\s\S]*?((?:- \*\*IF[\s\S]*?)+)(?=\n---|\n##|$)/);
+        if (varMatch) {
+          const varLinks = varMatch[1].match(/\[\[([^\]|]+)/g) || [];
+          for (const link of varLinks) {
+            const name = link.replace("[[", "").trim();
+            if (name && name.startsWith("VAR -")) {
+              variables.push(name);
+            }
+          }
+        }
         const navigation = [];
         const navMatch = content.match(/## Navigation[\s\S]*?((?:\[\[[^\]]+\]\][^\n]*\n?)+)/);
         if (navMatch) {
@@ -6990,6 +7480,7 @@ enrichment_sources: ${enrichments.sources_analyzed} videos
           order,
           cluster: (frontmatter == null ? void 0 : frontmatter.cluster) || "",
           invariables,
+          variables,
           navigation
         });
       } else if ((frontmatter == null ? void 0 : frontmatter.type) === "method" || (frontmatter == null ? void 0 : frontmatter.type) === "concept" || (frontmatter == null ? void 0 : frontmatter.method_type)) {
@@ -7103,9 +7594,187 @@ enrichment_sources: ${enrichments.sources_analyzed} videos
     } else {
       await this.app.vault.create(canvasPath, canvasContent);
     }
+    const varCanvasData = { nodes: [], edges: [] };
+    const varNodeIdMap = /* @__PURE__ */ new Map();
+    let varCurrentX = 100;
+    const varCheckpointY = 100;
+    for (let i = 0; i < checkpoints.length; i++) {
+      const cp = checkpoints[i];
+      const nodeId = `checkpoint-${i}`;
+      varNodeIdMap.set(cp.file.basename, nodeId);
+      varCanvasData.nodes.push({
+        id: nodeId,
+        type: "file",
+        file: cp.file.path,
+        x: varCurrentX,
+        y: varCheckpointY,
+        width: checkpointWidth,
+        height: checkpointHeight,
+        color: "4"
+      });
+      let varY = varCheckpointY + checkpointHeight + methodGap;
+      for (const varName of cp.variables) {
+        const varFile = methods.find((m) => m.file.basename === varName);
+        if (varFile) {
+          const varId = `var-${varNodeIdMap.size}`;
+          varNodeIdMap.set(varName, varId);
+          varCanvasData.nodes.push({
+            id: varId,
+            type: "file",
+            file: varFile.file.path,
+            x: varCurrentX + methodOffsetX,
+            y: varY,
+            width: methodWidth + 50,
+            height: methodHeight,
+            color: "2"
+            // Green for variables
+          });
+          varCanvasData.edges.push({
+            id: `edge-${varCanvasData.edges.length}`,
+            fromNode: nodeId,
+            fromSide: "bottom",
+            toNode: varId,
+            toSide: "top"
+          });
+          varY += methodHeight + 30;
+        }
+      }
+      if (i < checkpoints.length - 1) {
+        varCanvasData.edges.push({
+          id: `edge-cp-${i}`,
+          fromNode: nodeId,
+          fromSide: "right",
+          toNode: `checkpoint-${i + 1}`,
+          toSide: "left",
+          color: "5"
+        });
+      }
+      varCurrentX += horizontalGap;
+    }
+    const varCanvasPath = `${folder.path}/${canvasBasename} - Variables.canvas`;
+    const varCanvasContent = JSON.stringify(varCanvasData, null, 2);
+    const existingVarCanvas = this.app.vault.getAbstractFileByPath(varCanvasPath);
+    if (existingVarCanvas) {
+      await this.app.vault.modify(existingVarCanvas, varCanvasContent);
+    } else {
+      await this.app.vault.create(varCanvasPath, varCanvasContent);
+    }
     const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
     if (canvasFile) {
       await this.app.workspace.getLeaf().openFile(canvasFile);
+    }
+    return canvasPath;
+  }
+  /**
+   * Generate only the Variables canvas (without running full enrichment).
+   */
+  async generateVariablesCanvasOnly(folder, canvasBasename) {
+    var _a, _b;
+    const checkpoints = [];
+    const methods = [];
+    for (const file of this.app.vault.getFiles()) {
+      if (file.extension !== "md")
+        continue;
+      if (((_a = file.parent) == null ? void 0 : _a.path) !== folder.path)
+        continue;
+      const cache = this.app.metadataCache.getFileCache(file);
+      const frontmatter = cache == null ? void 0 : cache.frontmatter;
+      if ((frontmatter == null ? void 0 : frontmatter.type) === "checkpoint") {
+        const content = await this.app.vault.read(file);
+        const order = (frontmatter == null ? void 0 : frontmatter.order) || parseInt(((_b = file.basename.match(/\[(\d+)\]/)) == null ? void 0 : _b[1]) || "99");
+        const variables = [];
+        const varMatch = content.match(/## VARIABLES[\s\S]*?((?:- \*\*IF[\s\S]*?)+)(?=\n---|\n##|$)/);
+        if (varMatch) {
+          const varLinks = varMatch[1].match(/\[\[([^\]|]+)/g) || [];
+          for (const link of varLinks) {
+            const name = link.replace("[[", "").trim();
+            if (name && name.startsWith("VAR -")) {
+              variables.push(name);
+            }
+          }
+        }
+        checkpoints.push({ file, order, variables });
+      } else if ((frontmatter == null ? void 0 : frontmatter.type) === "method" || (frontmatter == null ? void 0 : frontmatter.method_type)) {
+        methods.push({
+          file,
+          tier: (frontmatter == null ? void 0 : frontmatter.tier) || (frontmatter == null ? void 0 : frontmatter.method_type) || "REFINEMENT"
+        });
+      }
+    }
+    if (checkpoints.length === 0) {
+      throw new Error("No checkpoint files found");
+    }
+    checkpoints.sort((a, b) => a.order - b.order);
+    const canvasData = { nodes: [], edges: [] };
+    const checkpointWidth = 300;
+    const checkpointHeight = 150;
+    const methodWidth = 250;
+    const methodHeight = 80;
+    const horizontalGap = 400;
+    const methodGap = 100;
+    const methodOffsetX = 350;
+    let currentX = 100;
+    const checkpointY = 100;
+    const nodeIdMap = /* @__PURE__ */ new Map();
+    for (let i = 0; i < checkpoints.length; i++) {
+      const cp = checkpoints[i];
+      const nodeId = `checkpoint-${i}`;
+      nodeIdMap.set(cp.file.basename, nodeId);
+      canvasData.nodes.push({
+        id: nodeId,
+        type: "file",
+        file: cp.file.path,
+        x: currentX,
+        y: checkpointY,
+        width: checkpointWidth,
+        height: checkpointHeight,
+        color: "4"
+      });
+      let varY = checkpointY + checkpointHeight + methodGap;
+      for (const varName of cp.variables) {
+        const varFile = methods.find((m) => m.file.basename === varName);
+        if (varFile) {
+          const varId = `var-${nodeIdMap.size}`;
+          nodeIdMap.set(varName, varId);
+          canvasData.nodes.push({
+            id: varId,
+            type: "file",
+            file: varFile.file.path,
+            x: currentX + methodOffsetX,
+            y: varY,
+            width: methodWidth,
+            height: methodHeight,
+            color: "2"
+          });
+          canvasData.edges.push({
+            id: `edge-${canvasData.edges.length}`,
+            fromNode: nodeId,
+            fromSide: "bottom",
+            toNode: varId,
+            toSide: "top"
+          });
+          varY += methodHeight + 30;
+        }
+      }
+      if (i < checkpoints.length - 1) {
+        canvasData.edges.push({
+          id: `edge-cp-${i}`,
+          fromNode: nodeId,
+          fromSide: "right",
+          toNode: `checkpoint-${i + 1}`,
+          toSide: "left",
+          color: "5"
+        });
+      }
+      currentX += horizontalGap;
+    }
+    const canvasPath = `${folder.path}/${canvasBasename} - Variables.canvas`;
+    const canvasContent = JSON.stringify(canvasData, null, 2);
+    const existingCanvas = this.app.vault.getAbstractFileByPath(canvasPath);
+    if (existingCanvas) {
+      await this.app.vault.modify(existingCanvas, canvasContent);
+    } else {
+      await this.app.vault.create(canvasPath, canvasContent);
     }
     return canvasPath;
   }
@@ -7852,5 +8521,146 @@ var BJJFlipmodeSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.syncInterval = value;
       await this.plugin.saveSettings();
     }));
+  }
+};
+var ConceptCacheClipsModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, sourceNode, sourceFile, cacheData) {
+    super(app);
+    this.plugin = plugin;
+    this.sourceNode = sourceNode;
+    this.sourceFile = sourceFile;
+    this.cacheData = cacheData;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("concept-cache-clips-modal");
+    const { video_id, video_name, instructor, content, timestamps } = this.cacheData;
+    contentEl.createEl("h2", { text: "Concept Cache - Click Timestamp to Extract Clip" });
+    const infoEl = contentEl.createEl("div", { cls: "video-info" });
+    infoEl.style.cssText = "margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px;";
+    infoEl.createEl("p", { text: `Video: ${video_name || video_id}` });
+    infoEl.createEl("p", { text: `Instructor: ${instructor || "Unknown"}` });
+    infoEl.createEl("p", { text: `Timestamps found: ${(timestamps == null ? void 0 : timestamps.length) || 0}` });
+    contentEl.createEl("p", {
+      text: "Click any timestamp to extract a 60-second clip and add it as a node on the canvas.",
+      cls: "instructions"
+    }).style.cssText = "color: var(--text-accent); margin-bottom: 15px;";
+    if (timestamps && timestamps.length > 0) {
+      const listEl = contentEl.createEl("div", { cls: "timestamps-list" });
+      listEl.style.cssText = "max-height: 400px; overflow-y: auto;";
+      for (const ts of timestamps) {
+        const tsEl = listEl.createEl("div", { cls: "timestamp-item" });
+        tsEl.style.cssText = "padding: 12px; margin-bottom: 10px; background: var(--background-primary-alt); border-radius: 5px; cursor: pointer; border-left: 3px solid var(--text-accent);";
+        const headerEl = tsEl.createEl("div", { cls: "ts-header" });
+        headerEl.style.cssText = "display: flex; justify-content: space-between; align-items: center;";
+        const timeBtn = headerEl.createEl("span", { cls: "timestamp-btn" });
+        timeBtn.style.cssText = "font-weight: bold; font-size: 1.1em; color: var(--text-accent); cursor: pointer;";
+        timeBtn.textContent = ts.timestamp || ts.time || "0:00";
+        const durationEl = headerEl.createEl("span");
+        durationEl.style.cssText = "font-size: 0.85em; color: var(--text-muted);";
+        durationEl.textContent = "60s clip";
+        if (ts.description || ts.context || ts.text) {
+          const descEl = tsEl.createEl("div", { cls: "ts-description" });
+          descEl.style.cssText = "margin-top: 8px; font-size: 0.9em; color: var(--text-muted);";
+          descEl.textContent = (ts.description || ts.context || ts.text).substring(0, 200);
+        }
+        tsEl.addEventListener("click", async () => {
+          await this.extractClipAtTimestamp(ts.timestamp || ts.time || "0:00", ts.description || ts.context || "");
+        });
+        tsEl.addEventListener("mouseenter", () => {
+          tsEl.style.background = "var(--background-modifier-hover)";
+        });
+        tsEl.addEventListener("mouseleave", () => {
+          tsEl.style.background = "var(--background-primary-alt)";
+        });
+      }
+    } else {
+      contentEl.createEl("p", { text: "No structured timestamps found. Showing raw content:" });
+      const contentDiv = contentEl.createEl("div", { cls: "raw-content" });
+      contentDiv.style.cssText = "max-height: 400px; overflow-y: auto; padding: 10px; background: var(--background-primary-alt); border-radius: 5px; font-size: 0.9em;";
+      const timestampRegex = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g;
+      let lastIndex = 0;
+      let match;
+      const rawContent = content || "";
+      while ((match = timestampRegex.exec(rawContent)) !== null) {
+        if (match.index > lastIndex) {
+          contentDiv.appendText(rawContent.substring(lastIndex, match.index));
+        }
+        const tsSpan = contentDiv.createEl("span", { cls: "clickable-timestamp" });
+        tsSpan.style.cssText = "color: var(--text-accent); cursor: pointer; font-weight: bold; text-decoration: underline;";
+        tsSpan.textContent = match[0];
+        const timestamp = match[1];
+        tsSpan.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          await this.extractClipAtTimestamp(timestamp, "");
+        });
+        lastIndex = match.index + match[0].length;
+      }
+      if (lastIndex < rawContent.length) {
+        contentDiv.appendText(rawContent.substring(lastIndex));
+      }
+    }
+    const footerEl = contentEl.createEl("div", { cls: "modal-footer" });
+    footerEl.style.cssText = "margin-top: 15px; text-align: right;";
+    new import_obsidian.Setting(footerEl).addButton((btn) => btn.setButtonText("Close").onClick(() => this.close()));
+  }
+  async extractClipAtTimestamp(timestamp, description) {
+    var _a;
+    const { video_id } = this.cacheData;
+    const parts = timestamp.split(":").map((p) => parseInt(p, 10));
+    let startSeconds = 0;
+    if (parts.length === 3) {
+      startSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    } else if (parts.length === 2) {
+      startSeconds = parts[0] * 60 + parts[1];
+    }
+    new import_obsidian.Notice(`Extracting 60s clip from ${timestamp}...`);
+    try {
+      const parentPath = ((_a = this.sourceFile.parent) == null ? void 0 : _a.path) || "";
+      const vaultFolder = `${parentPath}/clips`;
+      const safeName = `${this.sourceFile.basename}_${timestamp.replace(/:/g, "-")}`;
+      const clipPath = await this.plugin.doExtractClip(video_id, startSeconds, 60, safeName, vaultFolder);
+      if (!clipPath) {
+        new import_obsidian.Notice("Failed to extract clip");
+        return;
+      }
+      new import_obsidian.Notice(`Clip extracted: ${clipPath}`);
+      const canvasView = this.app.workspace.getActiveViewOfType(import_obsidian.ItemView);
+      if (!canvasView || canvasView.getViewType() !== "canvas") {
+        new import_obsidian.Notice("Canvas not active - clip saved but node not added");
+        return;
+      }
+      const canvas = canvasView.canvas;
+      if (!canvas) {
+        new import_obsidian.Notice("Could not access canvas");
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const clipFile = this.app.vault.getAbstractFileByPath(clipPath);
+      if (clipFile && clipFile instanceof import_obsidian.TFile) {
+        canvas.createFileNode({
+          file: clipFile,
+          pos: {
+            x: this.sourceNode.x + this.sourceNode.width + 50,
+            y: this.sourceNode.y
+          },
+          size: {
+            width: 320,
+            height: 240
+          }
+        });
+        canvas.requestSave();
+        new import_obsidian.Notice(`Clip node added to canvas at ${timestamp}`);
+      } else {
+        new import_obsidian.Notice(`Clip saved but file not found in vault: ${clipPath}`);
+      }
+    } catch (error) {
+      new import_obsidian.Notice(`Error: ${error.message}`);
+      console.error("Extract clip error:", error);
+    }
+  }
+  onClose() {
+    this.contentEl.empty();
   }
 };

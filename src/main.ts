@@ -23,6 +23,8 @@ interface BJJFlipmodeSettings {
     athleteName: string;
     // Concepts folder structure
     conceptsSubfolder: string;
+    // Shared canvases: canvas path -> athlete IDs
+    sharedCanvases: Record<string, number[]>;
 }
 
 const DEFAULT_SETTINGS: BJJFlipmodeSettings = {
@@ -45,7 +47,9 @@ const DEFAULT_SETTINGS: BJJFlipmodeSettings = {
     // Athlete identity
     athleteName: 'Athlete',
     // Concepts folder structure
-    conceptsSubfolder: 'concepts'
+    conceptsSubfolder: 'concepts',
+    // Shared canvases
+    sharedCanvases: {}
 };
 
 // Pending job for tracking remote queries
@@ -169,6 +173,21 @@ class RemoteQueueClient {
         } catch {
             return false;
         }
+    }
+
+    async getCanvases(since?: string): Promise<Record<string, { data: any; updated_at: string }>> {
+        const url = since
+            ? `${this.baseUrl}/api/queue/canvases?since=${encodeURIComponent(since)}`
+            : `${this.baseUrl}/api/queue/canvases`;
+
+        const response = await requestUrl({
+            url: url,
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${this.token}`
+            }
+        });
+        return response.json.canvases || {};
     }
 }
 
@@ -302,6 +321,23 @@ class CoachQueueClient {
                 concept_name: conceptName,
                 concept_summary: conceptSummary,
                 graph_data: graphData
+            })
+        });
+        return response.json;
+    }
+
+    async syncCanvas(athleteId: number, canvasName: string, canvasData: any): Promise<{ success: boolean }> {
+        const response = await requestUrl({
+            url: `${this.baseUrl}/api/coach/sync-canvas`,
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${this.token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                athlete_id: athleteId,
+                canvas_name: canvasName,
+                canvas_data: canvasData
             })
         });
         return response.json;
@@ -494,6 +530,39 @@ export default class BJJFlipmodePlugin extends Plugin {
             }
         });
 
+        // Generate Variables canvas from current canvas
+        this.addCommand({
+            id: 'flipmode-generate-variables-canvas',
+            name: 'Generate Variables Canvas',
+            checkCallback: (checking: boolean) => {
+                const canvasView = this.app.workspace.getActiveViewOfType(ItemView);
+                if (canvasView && canvasView.getViewType() === 'canvas') {
+                    if (!checking) {
+                        this.generateVariablesCanvas(canvasView);
+                    }
+                    return true;
+                }
+                return false;
+            }
+        });
+
+        // Toggle between RLM and Variables canvas
+        this.addCommand({
+            id: 'flipmode-toggle-canvas',
+            name: 'Toggle RLM/Variables Canvas',
+            hotkeys: [{ modifiers: ['Ctrl', 'Shift'], key: 'v' }],
+            checkCallback: (checking: boolean) => {
+                const canvasView = this.app.workspace.getActiveViewOfType(ItemView);
+                if (canvasView && canvasView.getViewType() === 'canvas') {
+                    if (!checking) {
+                        this.toggleRLMVariablesCanvas(canvasView);
+                    }
+                    return true;
+                }
+                return false;
+            }
+        });
+
         // Add settings tab
         this.addSettingTab(new BJJFlipmodeSettingTab(this.app, this));
 
@@ -610,18 +679,88 @@ export default class BJJFlipmodePlugin extends Plugin {
                         });
                     }
 
-                    // Extract Clip - for method nodes with timestamp
-                    if (cache?.frontmatter?.type === 'method' && cache.frontmatter.timestamp) {
+                    // For nodes with video_id - clip extraction options
+                    if (cache?.frontmatter?.video_id) {
+                        // Direct clip extraction at the timestamp in frontmatter
+                        if (cache.frontmatter.timestamp) {
+                            menu.addItem((item) => {
+                                item
+                                    .setTitle(`Extract Clip at ${cache.frontmatter.timestamp}`)
+                                    .setIcon('video')
+                                    .onClick(async () => {
+                                        await this.extractClipDirect(node, cache.frontmatter);
+                                    });
+                            });
+                        }
+
+                        // Browse all timestamps in concept cache
                         menu.addItem((item) => {
                             item
-                                .setTitle('Extract WebM Clip')
-                                .setIcon('video')
+                                .setTitle('Browse All Timestamps')
+                                .setIcon('list')
                                 .onClick(async () => {
-                                    await this.extractClipFromMethod(node.file, cache.frontmatter);
+                                    await this.openConceptCacheForClips(node, cache.frontmatter);
                                 });
                         });
                     }
                 }
+            })
+        );
+
+        // Canvas background right-click menu (coach mode)
+        this.registerEvent(
+            (this.app.workspace as any).on('canvas:menu', (menu: Menu, canvas: any) => {
+                if (this.settings.mode !== 'coach' || !this.coachClient) return;
+
+                const canvasView = this.app.workspace.getActiveViewOfType(ItemView);
+                if (!canvasView || canvasView.getViewType() !== 'canvas') return;
+
+                const canvasFile = (canvasView as any).file as TFile;
+                if (!canvasFile) return;
+
+                const isShared = this.settings.sharedCanvases[canvasFile.path]?.length > 0;
+
+                menu.addItem((item) => {
+                    item
+                        .setTitle(isShared ? 'Update Shared Canvas' : 'Share Canvas with Athlete')
+                        .setIcon('send')
+                        .onClick(async () => {
+                            await this.shareCanvasWithAthlete(canvasFile);
+                        });
+                });
+
+                if (isShared) {
+                    menu.addItem((item) => {
+                        item
+                            .setTitle('Stop Sharing Canvas')
+                            .setIcon('x')
+                            .onClick(async () => {
+                                delete this.settings.sharedCanvases[canvasFile.path];
+                                await this.saveSettings();
+                                new Notice('Canvas unshared');
+                            });
+                    });
+                }
+            })
+        );
+
+        // Watch for changes to shared canvases (auto-sync)
+        this.registerEvent(
+            this.app.vault.on('modify', async (file: TAbstractFile) => {
+                if (!(file instanceof TFile)) return;
+                if (file.extension !== 'canvas') return;
+                if (this.settings.mode !== 'coach' || !this.coachClient) return;
+
+                const sharedWith = this.settings.sharedCanvases[file.path];
+                if (!sharedWith || sharedWith.length === 0) return;
+
+                // Debounce: wait 2 seconds before syncing
+                if ((this as any)._canvasSyncTimeout) {
+                    clearTimeout((this as any)._canvasSyncTimeout);
+                }
+                (this as any)._canvasSyncTimeout = setTimeout(async () => {
+                    await this.syncSharedCanvas(file, sharedWith);
+                }, 2000);
             })
         );
 
@@ -633,14 +772,27 @@ export default class BJJFlipmodePlugin extends Plugin {
                 // Canvas files - share with athlete
                 if (file.extension === 'canvas') {
                     if (this.settings.mode === 'coach' && this.coachClient) {
+                        const isShared = this.settings.sharedCanvases[file.path]?.length > 0;
                         menu.addItem((item) => {
                             item
-                                .setTitle('Share Canvas with Athlete')
+                                .setTitle(isShared ? 'Update Shared Canvas' : 'Share Canvas with Athlete')
                                 .setIcon('send')
                                 .onClick(async () => {
                                     await this.shareCanvasWithAthlete(file);
                                 });
                         });
+                        if (isShared) {
+                            menu.addItem((item) => {
+                                item
+                                    .setTitle('Stop Sharing')
+                                    .setIcon('x')
+                                    .onClick(async () => {
+                                        delete this.settings.sharedCanvases[file.path];
+                                        await this.saveSettings();
+                                        new Notice('Canvas unshared');
+                                    });
+                            });
+                        }
                     }
                     return;
                 }
@@ -1015,7 +1167,16 @@ ${job.query_text}
                     );
 
                     if (result.success) {
-                        new Notice(`Shared with ${selectedAthlete.display_name || selectedAthlete.discord_username}!`);
+                        // Track this canvas as shared for auto-sync
+                        if (!this.settings.sharedCanvases[file.path]) {
+                            this.settings.sharedCanvases[file.path] = [];
+                        }
+                        if (!this.settings.sharedCanvases[file.path].includes(selectedAthlete.id)) {
+                            this.settings.sharedCanvases[file.path].push(selectedAthlete.id);
+                        }
+                        await this.saveSettings();
+
+                        new Notice(`Shared with ${selectedAthlete.display_name || selectedAthlete.discord_username}! Changes will auto-sync.`);
                     } else {
                         new Notice(`Saved but Discord notification failed: ${result.message}`);
                     }
@@ -1029,6 +1190,44 @@ ${job.query_text}
         } catch (error: any) {
             new Notice(`Failed to get athletes: ${error.message}`);
         }
+    }
+
+    /**
+     * Sync a shared canvas to all athletes it's shared with.
+     * Called automatically when a shared canvas is modified.
+     */
+    async syncSharedCanvas(file: TFile, athleteIds: number[]) {
+        if (!this.coachClient) return;
+
+        const content = await this.app.vault.read(file);
+        let canvasData: any;
+        try {
+            canvasData = JSON.parse(content);
+        } catch (e) {
+            return; // Invalid canvas, skip
+        }
+
+        const canvasName = file.basename;
+
+        for (const athleteId of athleteIds) {
+            try {
+                await this.coachClient.syncCanvas(
+                    athleteId,
+                    canvasName,
+                    {
+                        type: 'canvas',
+                        canvasName: canvasName,
+                        nodes: canvasData.nodes || [],
+                        edges: canvasData.edges || [],
+                        updatedAt: Date.now()
+                    }
+                );
+            } catch (error) {
+                console.error(`Failed to sync canvas to athlete ${athleteId}:`, error);
+            }
+        }
+
+        new Notice(`Canvas synced to ${athleteIds.length} athlete(s)`);
     }
 
     /**
@@ -1842,6 +2041,105 @@ ${job.query_text}
     }
 
     /**
+     * Generate Variables canvas from current canvas folder.
+     */
+    async generateVariablesCanvas(canvasView: ItemView) {
+        try {
+            const canvasFile = (canvasView as any).file as TFile;
+            if (!canvasFile) {
+                new Notice('Could not determine canvas file');
+                return;
+            }
+
+            const parentFolder = canvasFile.parent;
+            if (!parentFolder) {
+                new Notice('Could not determine folder');
+                return;
+            }
+
+            // Check for subfolder with same name as canvas
+            const canvasBasename = canvasFile.basename.replace(/ - RLM$/, '').replace(/ - Variables$/, '');
+            const subfolderPath = `${parentFolder.path}/${canvasBasename}`;
+            const subfolder = this.app.vault.getAbstractFileByPath(subfolderPath);
+
+            const targetFolderPath = (subfolder && subfolder instanceof TFolder)
+                ? subfolderPath
+                : parentFolder.path;
+
+            const targetFolder = this.app.vault.getAbstractFileByPath(targetFolderPath) as TFolder;
+
+            new Notice('Generating Variables canvas...');
+
+            // Use a temporary modal just to call rebuildCanvasForFolder
+            const tempModal = new RLMPipelineModal(this.app, this, canvasFile, targetFolder, []);
+            const variablesPath = await tempModal.generateVariablesCanvasOnly(targetFolder, canvasBasename);
+
+            new Notice(`Variables canvas created: ${variablesPath}`);
+
+            // Open the variables canvas
+            const varCanvasFile = this.app.vault.getAbstractFileByPath(variablesPath);
+            if (varCanvasFile) {
+                await this.app.workspace.getLeaf().openFile(varCanvasFile as TFile);
+            }
+
+        } catch (error: any) {
+            new Notice(`Error: ${error.message}`);
+            console.error('Generate variables canvas error:', error);
+        }
+    }
+
+    /**
+     * Toggle between RLM and Variables canvas.
+     */
+    async toggleRLMVariablesCanvas(canvasView: ItemView) {
+        try {
+            const canvasFile = (canvasView as any).file as TFile;
+            if (!canvasFile) {
+                new Notice('Could not determine canvas file');
+                return;
+            }
+
+            const currentName = canvasFile.basename;
+            const folderPath = canvasFile.parent?.path || '';
+            let targetPath: string;
+
+            if (currentName.endsWith(' - RLM')) {
+                // Switch to Variables
+                const baseName = currentName.replace(/ - RLM$/, '');
+                targetPath = `${folderPath}/${baseName} - Variables.canvas`;
+            } else if (currentName.endsWith(' - Variables')) {
+                // Switch to RLM
+                const baseName = currentName.replace(/ - Variables$/, '');
+                targetPath = `${folderPath}/${baseName} - RLM.canvas`;
+            } else {
+                // Try to find either variant
+                const rlmPath = `${folderPath}/${currentName} - RLM.canvas`;
+                const varPath = `${folderPath}/${currentName} - Variables.canvas`;
+
+                if (this.app.vault.getAbstractFileByPath(rlmPath)) {
+                    targetPath = rlmPath;
+                } else if (this.app.vault.getAbstractFileByPath(varPath)) {
+                    targetPath = varPath;
+                } else {
+                    new Notice('No RLM or Variables canvas found');
+                    return;
+                }
+            }
+
+            const targetFile = this.app.vault.getAbstractFileByPath(targetPath);
+            if (targetFile && targetFile instanceof TFile) {
+                await this.app.workspace.getLeaf().openFile(targetFile);
+            } else {
+                new Notice(`Canvas not found: ${targetPath}`);
+            }
+
+        } catch (error: any) {
+            new Notice(`Error: ${error.message}`);
+            console.error('Toggle canvas error:', error);
+        }
+    }
+
+    /**
      * Rebuild Canvas from checkpoint files - proper layout with all connections.
      * This regenerates the entire canvas from the enriched markdown files.
      */
@@ -2118,7 +2416,255 @@ ${job.query_text}
     /**
      * Actually extract a WebM clip after user selects it.
      */
-    async doExtractClip(videoId: string, startTime: number, duration: number, outputName: string): Promise<string | null> {
+    /**
+     * Fetch a 60s clip and attach it as a new node on the canvas.
+     */
+    async fetchClipAndAttachNode(node: any, frontmatter: any) {
+        const { video_id, timestamp } = frontmatter;
+        const file = node.file as TFile;
+
+        if (!video_id) {
+            new Notice('No video_id in frontmatter');
+            return;
+        }
+
+        // Parse timestamp to seconds
+        let startSeconds = 0;
+        if (timestamp) {
+            const parts = timestamp.split(':').map((p: string) => parseInt(p, 10));
+            if (parts.length === 3) {
+                startSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+            } else if (parts.length === 2) {
+                startSeconds = parts[0] * 60 + parts[1];
+            }
+        }
+
+        new Notice(`Fetching 60s clip from ${timestamp || '0:00'}...`);
+
+        try {
+            // Determine vault folder for clips (same folder as the method file, in a clips subfolder)
+            const parentPath = file.parent?.path || '';
+            const vaultFolder = `${parentPath}/clips`;
+
+            // Extract the clip
+            const clipName = `${file.basename}_clip_${timestamp?.replace(/:/g, '-') || 'start'}`;
+            const clipPath = await this.doExtractClip(video_id, startSeconds, 60, clipName, vaultFolder);
+
+            if (!clipPath) {
+                new Notice('Failed to extract clip');
+                return;
+            }
+
+            new Notice(`Clip extracted: ${clipPath}`);
+
+            // Get the canvas
+            const canvasView = this.app.workspace.getActiveViewOfType(ItemView);
+            if (!canvasView || canvasView.getViewType() !== 'canvas') {
+                new Notice('Canvas not active - clip saved but node not added');
+                return;
+            }
+
+            const canvas = (canvasView as any).canvas;
+            if (!canvas) {
+                new Notice('Could not access canvas');
+                return;
+            }
+
+            // Find or create the clip file in vault
+            // The clip is at clipPath which is relative to vault
+            const clipFile = this.app.vault.getAbstractFileByPath(clipPath);
+
+            if (clipFile && clipFile instanceof TFile) {
+                // Create a new node for the clip to the right of the source node
+                const newNode = canvas.createFileNode({
+                    file: clipFile,
+                    pos: {
+                        x: node.x + node.width + 50,
+                        y: node.y
+                    },
+                    size: {
+                        width: 320,
+                        height: 240
+                    }
+                });
+
+                // Try to create edge (may not work on all Obsidian versions)
+                try {
+                    if (canvas.createEdge) {
+                        canvas.createEdge({
+                            fromNode: node,
+                            fromSide: 'right',
+                            toNode: newNode,
+                            toSide: 'left'
+                        });
+                    }
+                } catch (e) {
+                    // Edge creation not supported, that's fine
+                }
+
+                canvas.requestSave();
+                new Notice(`Clip node added to canvas`);
+            } else {
+                new Notice(`Clip saved at ${clipPath} but file not found in vault`);
+            }
+
+        } catch (error: any) {
+            new Notice(`Error: ${error.message}`);
+            console.error('Fetch clip error:', error);
+        }
+    }
+
+    /**
+     * Extract clip directly at the timestamp specified in frontmatter.
+     * Adds the clip as a new canvas node.
+     */
+    async extractClipDirect(node: any, frontmatter: any) {
+        const { video_id, timestamp } = frontmatter;
+        const file = node.file as TFile;
+
+        if (!video_id) {
+            new Notice('No video_id in frontmatter');
+            return;
+        }
+
+        if (!timestamp) {
+            new Notice('No timestamp in frontmatter');
+            return;
+        }
+
+        // Parse timestamp to seconds
+        const parts = timestamp.split(':').map((p: string) => parseInt(p, 10));
+        let startSeconds = 0;
+        if (parts.length === 3) {
+            startSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+        } else if (parts.length === 2) {
+            startSeconds = parts[0] * 60 + parts[1];
+        }
+
+        new Notice(`Extracting 2min clip at ${timestamp}...`);
+
+        try {
+            // Determine output folder
+            const parentPath = file.parent?.path || '';
+            const vaultFolder = `${parentPath}/clips`;
+
+            // Create clip name
+            const safeName = `${file.basename}_${timestamp.replace(/:/g, '-')}`;
+
+            // Extract 2 minute clip
+            const clipPath = await this.doExtractClip(video_id, startSeconds, 120, safeName, vaultFolder);
+
+            if (!clipPath) {
+                new Notice('Failed to extract clip');
+                return;
+            }
+
+            new Notice(`Clip extracted: ${clipPath}`);
+
+            // Get the canvas and add node
+            const canvasView = this.app.workspace.getActiveViewOfType(ItemView);
+            if (!canvasView || canvasView.getViewType() !== 'canvas') {
+                new Notice('Canvas not active - clip saved but node not added');
+                return;
+            }
+
+            const canvas = (canvasView as any).canvas;
+            if (!canvas) {
+                new Notice('Could not access canvas');
+                return;
+            }
+
+            // Wait for vault to register the file
+            await new Promise(resolve => setTimeout(resolve, 500));
+
+            // Find the clip file
+            const clipFile = this.app.vault.getAbstractFileByPath(clipPath);
+
+            if (clipFile && clipFile instanceof TFile) {
+                // Create small video window below and to the right of the source node
+                const clipNode = canvas.createFileNode({
+                    file: clipFile,
+                    pos: {
+                        x: node.x + node.width + 30,
+                        y: node.y + 20
+                    },
+                    size: {
+                        width: 200,
+                        height: 150
+                    }
+                });
+
+                // Create edge connecting source node to clip node
+                if (clipNode) {
+                    canvas.addEdge({
+                        fromNode: node,
+                        fromSide: 'right',
+                        toNode: clipNode,
+                        toSide: 'left'
+                    });
+                }
+
+                canvas.requestSave();
+                new Notice(`Clip linked at ${timestamp}`);
+            } else {
+                new Notice(`Clip saved but not found in vault: ${clipPath}`);
+            }
+
+        } catch (error: any) {
+            new Notice(`Error: ${error.message}`);
+            console.error('Extract clip error:', error);
+        }
+    }
+
+    /**
+     * Open Concept Cache viewer with clickable timestamps for clip extraction.
+     * Clicking a timestamp extracts a clip and adds it as a canvas node.
+     */
+    async openConceptCacheForClips(node: any, frontmatter: any) {
+        const { video_id } = frontmatter;
+        const file = node.file as TFile;
+
+        if (!video_id) {
+            new Notice('No video_id in frontmatter');
+            return;
+        }
+
+        new Notice(`Loading concept cache for ${video_id}...`);
+
+        try {
+            // Fetch concept cache from API
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/obsidian/concept-cache/${video_id}`,
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${this.settings.apiToken}`
+                }
+            });
+
+            const data = response.json;
+
+            if (data.error) {
+                new Notice(`Error: ${data.error}`);
+                return;
+            }
+
+            // Open the Concept Cache Clips modal
+            const modal = new ConceptCacheClipsModal(
+                this.app,
+                this,
+                node,
+                file,
+                data
+            );
+            modal.open();
+
+        } catch (error: any) {
+            new Notice(`Error loading concept cache: ${error.message}`);
+            console.error('Concept cache error:', error);
+        }
+    }
+
+    async doExtractClip(videoId: string, startTime: number, duration: number, outputName: string, vaultFolder?: string): Promise<string | null> {
         try {
             const response = await requestUrl({
                 url: `${this.settings.serverUrl}/api/obsidian/extract-clip`,
@@ -2131,7 +2677,8 @@ ${job.query_text}
                     video_id: videoId,
                     start_time: startTime,
                     duration: duration,
-                    output_name: outputName
+                    output_name: outputName,
+                    vault_folder: vaultFolder || ''
                 })
             });
 
@@ -2687,11 +3234,80 @@ ${job.query_text}
             this.settings.athleteToken
         );
 
-        // Start polling for results
+        // Start polling for results and canvas updates
         this.startResultPolling();
+        this.startCanvasPolling();
 
         // Update status bar
         this.updateStatusBar('Remote Mode');
+    }
+
+    // Track last canvas sync time
+    private lastCanvasSync: string | null = null;
+    private canvasPollIntervalId: number | null = null;
+
+    startCanvasPolling() {
+        if (this.canvasPollIntervalId) {
+            window.clearInterval(this.canvasPollIntervalId);
+        }
+
+        // Poll every 30 seconds for canvas updates
+        this.canvasPollIntervalId = window.setInterval(
+            () => this.pollCanvasUpdates(),
+            30000
+        );
+
+        // Do an initial check
+        this.pollCanvasUpdates();
+    }
+
+    async pollCanvasUpdates() {
+        if (!this.queueClient) return;
+
+        try {
+            const canvases = await this.queueClient.getCanvases(this.lastCanvasSync || undefined);
+
+            if (Object.keys(canvases).length === 0) return;
+
+            // Sync each updated canvas to the vault
+            for (const [canvasName, canvasInfo] of Object.entries(canvases)) {
+                await this.syncCanvasToVault(canvasName, canvasInfo.data);
+            }
+
+            // Update last sync time
+            this.lastCanvasSync = new Date().toISOString();
+
+            new Notice(`Synced ${Object.keys(canvases).length} canvas update(s) from coach`);
+        } catch (error) {
+            console.error('Canvas poll error:', error);
+        }
+    }
+
+    async syncCanvasToVault(canvasName: string, canvasData: any) {
+        // Save to Flipmode/Coach folder
+        const coachFolder = `${this.settings.syncFolder}/Coach`;
+        await this.ensureFolder(coachFolder);
+
+        const canvasPath = `${coachFolder}/${canvasName}.canvas`;
+
+        // Convert canvas data back to Obsidian canvas format
+        const canvasContent = JSON.stringify({
+            nodes: canvasData.nodes || [],
+            edges: canvasData.edges || []
+        }, null, 2);
+
+        // Check if file exists
+        const existingFile = this.app.vault.getAbstractFileByPath(canvasPath);
+
+        if (existingFile && existingFile instanceof TFile) {
+            // Update existing canvas
+            await this.app.vault.modify(existingFile, canvasContent);
+        } else {
+            // Create new canvas
+            await this.app.vault.create(canvasPath, canvasContent);
+        }
+
+        console.log(`[Canvas Sync] Saved ${canvasName} to ${canvasPath}`);
     }
 
     startResultPolling() {
@@ -2884,6 +3500,9 @@ This note will be updated when results are ready.
         }
         if (this.pollIntervalId) {
             window.clearInterval(this.pollIntervalId);
+        }
+        if (this.canvasPollIntervalId) {
+            window.clearInterval(this.canvasPollIntervalId);
         }
     }
 
@@ -8915,6 +9534,19 @@ ${v.description || ''}
                     }
                 }
 
+                // Extract variables (IF/THEN links)
+                const variables: string[] = [];
+                const varMatch = content.match(/## VARIABLES[\s\S]*?((?:- \*\*IF[\s\S]*?)+)(?=\n---|\n##|$)/);
+                if (varMatch) {
+                    const varLinks = varMatch[1].match(/\[\[([^\]|]+)/g) || [];
+                    for (const link of varLinks) {
+                        const name = link.replace('[[', '').trim();
+                        if (name && name.startsWith('VAR -')) {
+                            variables.push(name);
+                        }
+                    }
+                }
+
                 // Extract navigation links
                 const navigation: string[] = [];
                 const navMatch = content.match(/## Navigation[\s\S]*?((?:\[\[[^\]]+\]\][^\n]*\n?)+)/);
@@ -8930,6 +9562,7 @@ ${v.description || ''}
                     order,
                     cluster: frontmatter?.cluster || '',
                     invariables,
+                    variables,
                     navigation
                 });
             } else if (frontmatter?.type === 'method' || frontmatter?.type === 'concept' || frontmatter?.method_type) {
@@ -9055,7 +9688,7 @@ ${v.description || ''}
             }
         }
 
-        // Write canvas file
+        // Write invariables canvas file
         const canvasPath = `${folder.path}/${canvasBasename} - RLM.canvas`;
         const canvasContent = JSON.stringify(canvasData, null, 2);
 
@@ -9066,10 +9699,224 @@ ${v.description || ''}
             await this.app.vault.create(canvasPath, canvasContent);
         }
 
-        // Open the new canvas
+        // Build VARIABLES canvas (checkpoints with IF/THEN branches below)
+        const varCanvasData: any = { nodes: [], edges: [] };
+        const varNodeIdMap: Map<string, string> = new Map();
+        let varCurrentX = 100;
+        const varCheckpointY = 100;
+
+        for (let i = 0; i < checkpoints.length; i++) {
+            const cp = checkpoints[i];
+            const nodeId = `checkpoint-${i}`;
+            varNodeIdMap.set(cp.file.basename, nodeId);
+
+            varCanvasData.nodes.push({
+                id: nodeId,
+                type: 'file',
+                file: cp.file.path,
+                x: varCurrentX,
+                y: varCheckpointY,
+                width: checkpointWidth,
+                height: checkpointHeight,
+                color: '4'
+            });
+
+            // Add variable nodes below checkpoint
+            let varY = varCheckpointY + checkpointHeight + methodGap;
+            for (const varName of cp.variables) {
+                const varFile = methods.find(m => m.file.basename === varName);
+                if (varFile) {
+                    const varId = `var-${varNodeIdMap.size}`;
+                    varNodeIdMap.set(varName, varId);
+
+                    varCanvasData.nodes.push({
+                        id: varId,
+                        type: 'file',
+                        file: varFile.file.path,
+                        x: varCurrentX + methodOffsetX,
+                        y: varY,
+                        width: methodWidth + 50,
+                        height: methodHeight,
+                        color: '2' // Green for variables
+                    });
+
+                    varCanvasData.edges.push({
+                        id: `edge-${varCanvasData.edges.length}`,
+                        fromNode: nodeId,
+                        fromSide: 'bottom',
+                        toNode: varId,
+                        toSide: 'top'
+                    });
+
+                    varY += methodHeight + 30;
+                }
+            }
+
+            // Edge to next checkpoint
+            if (i < checkpoints.length - 1) {
+                varCanvasData.edges.push({
+                    id: `edge-cp-${i}`,
+                    fromNode: nodeId,
+                    fromSide: 'right',
+                    toNode: `checkpoint-${i + 1}`,
+                    toSide: 'left',
+                    color: '5'
+                });
+            }
+
+            varCurrentX += horizontalGap;
+        }
+
+        // Write variables canvas file
+        const varCanvasPath = `${folder.path}/${canvasBasename} - Variables.canvas`;
+        const varCanvasContent = JSON.stringify(varCanvasData, null, 2);
+
+        const existingVarCanvas = this.app.vault.getAbstractFileByPath(varCanvasPath);
+        if (existingVarCanvas) {
+            await this.app.vault.modify(existingVarCanvas as TFile, varCanvasContent);
+        } else {
+            await this.app.vault.create(varCanvasPath, varCanvasContent);
+        }
+
+        // Open the invariables canvas (primary)
         const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
         if (canvasFile) {
             await this.app.workspace.getLeaf().openFile(canvasFile as TFile);
+        }
+
+        return canvasPath;
+    }
+
+    /**
+     * Generate only the Variables canvas (without running full enrichment).
+     */
+    async generateVariablesCanvasOnly(folder: TFolder, canvasBasename: string): Promise<string> {
+        // Find all checkpoint and method files in the folder
+        const checkpoints: any[] = [];
+        const methods: any[] = [];
+
+        for (const file of this.app.vault.getFiles()) {
+            if (file.extension !== 'md') continue;
+            if (file.parent?.path !== folder.path) continue;
+
+            const cache = this.app.metadataCache.getFileCache(file);
+            const frontmatter = cache?.frontmatter;
+
+            if (frontmatter?.type === 'checkpoint') {
+                const content = await this.app.vault.read(file);
+                const order = frontmatter?.order || parseInt(file.basename.match(/\[(\d+)\]/)?.[1] || '99');
+
+                // Extract variables
+                const variables: string[] = [];
+                const varMatch = content.match(/## VARIABLES[\s\S]*?((?:- \*\*IF[\s\S]*?)+)(?=\n---|\n##|$)/);
+                if (varMatch) {
+                    const varLinks = varMatch[1].match(/\[\[([^\]|]+)/g) || [];
+                    for (const link of varLinks) {
+                        const name = link.replace('[[', '').trim();
+                        if (name && name.startsWith('VAR -')) {
+                            variables.push(name);
+                        }
+                    }
+                }
+
+                checkpoints.push({ file, order, variables });
+            } else if (frontmatter?.type === 'method' || frontmatter?.method_type) {
+                methods.push({
+                    file,
+                    tier: frontmatter?.tier || frontmatter?.method_type || 'REFINEMENT'
+                });
+            }
+        }
+
+        if (checkpoints.length === 0) {
+            throw new Error('No checkpoint files found');
+        }
+
+        checkpoints.sort((a, b) => a.order - b.order);
+
+        // Build variables canvas
+        const canvasData: any = { nodes: [], edges: [] };
+        const checkpointWidth = 300;
+        const checkpointHeight = 150;
+        const methodWidth = 250;
+        const methodHeight = 80;
+        const horizontalGap = 400;
+        const methodGap = 100;
+        const methodOffsetX = 350;
+
+        let currentX = 100;
+        const checkpointY = 100;
+        const nodeIdMap: Map<string, string> = new Map();
+
+        for (let i = 0; i < checkpoints.length; i++) {
+            const cp = checkpoints[i];
+            const nodeId = `checkpoint-${i}`;
+            nodeIdMap.set(cp.file.basename, nodeId);
+
+            canvasData.nodes.push({
+                id: nodeId,
+                type: 'file',
+                file: cp.file.path,
+                x: currentX,
+                y: checkpointY,
+                width: checkpointWidth,
+                height: checkpointHeight,
+                color: '4'
+            });
+
+            // Add variable nodes below
+            let varY = checkpointY + checkpointHeight + methodGap;
+            for (const varName of cp.variables) {
+                const varFile = methods.find(m => m.file.basename === varName);
+                if (varFile) {
+                    const varId = `var-${nodeIdMap.size}`;
+                    nodeIdMap.set(varName, varId);
+
+                    canvasData.nodes.push({
+                        id: varId,
+                        type: 'file',
+                        file: varFile.file.path,
+                        x: currentX + methodOffsetX,
+                        y: varY,
+                        width: methodWidth,
+                        height: methodHeight,
+                        color: '2'
+                    });
+
+                    canvasData.edges.push({
+                        id: `edge-${canvasData.edges.length}`,
+                        fromNode: nodeId,
+                        fromSide: 'bottom',
+                        toNode: varId,
+                        toSide: 'top'
+                    });
+
+                    varY += methodHeight + 30;
+                }
+            }
+
+            if (i < checkpoints.length - 1) {
+                canvasData.edges.push({
+                    id: `edge-cp-${i}`,
+                    fromNode: nodeId,
+                    fromSide: 'right',
+                    toNode: `checkpoint-${i + 1}`,
+                    toSide: 'left',
+                    color: '5'
+                });
+            }
+
+            currentX += horizontalGap;
+        }
+
+        const canvasPath = `${folder.path}/${canvasBasename} - Variables.canvas`;
+        const canvasContent = JSON.stringify(canvasData, null, 2);
+
+        const existingCanvas = this.app.vault.getAbstractFileByPath(canvasPath);
+        if (existingCanvas) {
+            await this.app.vault.modify(existingCanvas as TFile, canvasContent);
+        } else {
+            await this.app.vault.create(canvasPath, canvasContent);
         }
 
         return canvasPath;
@@ -10274,5 +11121,218 @@ class BJJFlipmodeSettingTab extends PluginSettingTab {
                     this.plugin.settings.syncInterval = value;
                     await this.plugin.saveSettings();
                 }));
+    }
+}
+
+/**
+ * Concept Cache Clips Modal
+ * Shows concept cache content with clickable timestamps.
+ * Clicking a timestamp extracts a 60s clip and adds it as a canvas node.
+ */
+class ConceptCacheClipsModal extends Modal {
+    plugin: BJJFlipmodePlugin;
+    sourceNode: any;
+    sourceFile: TFile;
+    cacheData: any;
+
+    constructor(app: App, plugin: BJJFlipmodePlugin, sourceNode: any, sourceFile: TFile, cacheData: any) {
+        super(app);
+        this.plugin = plugin;
+        this.sourceNode = sourceNode;
+        this.sourceFile = sourceFile;
+        this.cacheData = cacheData;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.addClass('concept-cache-clips-modal');
+
+        const { video_id, video_name, instructor, content, timestamps } = this.cacheData;
+
+        // Header
+        contentEl.createEl('h2', { text: 'Concept Cache - Click Timestamp to Extract Clip' });
+
+        // Video info
+        const infoEl = contentEl.createEl('div', { cls: 'video-info' });
+        infoEl.style.cssText = 'margin-bottom: 15px; padding: 10px; background: var(--background-secondary); border-radius: 5px;';
+        infoEl.createEl('p', { text: `Video: ${video_name || video_id}` });
+        infoEl.createEl('p', { text: `Instructor: ${instructor || 'Unknown'}` });
+        infoEl.createEl('p', { text: `Timestamps found: ${timestamps?.length || 0}` });
+
+        // Instructions
+        contentEl.createEl('p', {
+            text: 'Click any timestamp to extract a 60-second clip and add it as a node on the canvas.',
+            cls: 'instructions'
+        }).style.cssText = 'color: var(--text-accent); margin-bottom: 15px;';
+
+        // Timestamps list
+        if (timestamps && timestamps.length > 0) {
+            const listEl = contentEl.createEl('div', { cls: 'timestamps-list' });
+            listEl.style.cssText = 'max-height: 400px; overflow-y: auto;';
+
+            for (const ts of timestamps) {
+                const tsEl = listEl.createEl('div', { cls: 'timestamp-item' });
+                tsEl.style.cssText = 'padding: 12px; margin-bottom: 10px; background: var(--background-primary-alt); border-radius: 5px; cursor: pointer; border-left: 3px solid var(--text-accent);';
+
+                // Timestamp button
+                const headerEl = tsEl.createEl('div', { cls: 'ts-header' });
+                headerEl.style.cssText = 'display: flex; justify-content: space-between; align-items: center;';
+
+                const timeBtn = headerEl.createEl('span', { cls: 'timestamp-btn' });
+                timeBtn.style.cssText = 'font-weight: bold; font-size: 1.1em; color: var(--text-accent); cursor: pointer;';
+                timeBtn.textContent = ts.timestamp || ts.time || '0:00';
+
+                const durationEl = headerEl.createEl('span');
+                durationEl.style.cssText = 'font-size: 0.85em; color: var(--text-muted);';
+                durationEl.textContent = '60s clip';
+
+                // Description/context
+                if (ts.description || ts.context || ts.text) {
+                    const descEl = tsEl.createEl('div', { cls: 'ts-description' });
+                    descEl.style.cssText = 'margin-top: 8px; font-size: 0.9em; color: var(--text-muted);';
+                    descEl.textContent = (ts.description || ts.context || ts.text).substring(0, 200);
+                }
+
+                // Click handler - extract clip
+                tsEl.addEventListener('click', async () => {
+                    await this.extractClipAtTimestamp(ts.timestamp || ts.time || '0:00', ts.description || ts.context || '');
+                });
+
+                // Hover effect
+                tsEl.addEventListener('mouseenter', () => {
+                    tsEl.style.background = 'var(--background-modifier-hover)';
+                });
+                tsEl.addEventListener('mouseleave', () => {
+                    tsEl.style.background = 'var(--background-primary-alt)';
+                });
+            }
+        } else {
+            // No timestamps - show raw content with timestamp detection
+            contentEl.createEl('p', { text: 'No structured timestamps found. Showing raw content:' });
+
+            const contentDiv = contentEl.createEl('div', { cls: 'raw-content' });
+            contentDiv.style.cssText = 'max-height: 400px; overflow-y: auto; padding: 10px; background: var(--background-primary-alt); border-radius: 5px; font-size: 0.9em;';
+
+            // Parse timestamps from content
+            const timestampRegex = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g;
+            let lastIndex = 0;
+            let match;
+            const rawContent = content || '';
+
+            while ((match = timestampRegex.exec(rawContent)) !== null) {
+                // Add text before timestamp
+                if (match.index > lastIndex) {
+                    contentDiv.appendText(rawContent.substring(lastIndex, match.index));
+                }
+
+                // Add clickable timestamp
+                const tsSpan = contentDiv.createEl('span', { cls: 'clickable-timestamp' });
+                tsSpan.style.cssText = 'color: var(--text-accent); cursor: pointer; font-weight: bold; text-decoration: underline;';
+                tsSpan.textContent = match[0];
+
+                const timestamp = match[1];
+                tsSpan.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    await this.extractClipAtTimestamp(timestamp, '');
+                });
+
+                lastIndex = match.index + match[0].length;
+            }
+
+            // Add remaining text
+            if (lastIndex < rawContent.length) {
+                contentDiv.appendText(rawContent.substring(lastIndex));
+            }
+        }
+
+        // Close button
+        const footerEl = contentEl.createEl('div', { cls: 'modal-footer' });
+        footerEl.style.cssText = 'margin-top: 15px; text-align: right;';
+        new Setting(footerEl)
+            .addButton(btn => btn
+                .setButtonText('Close')
+                .onClick(() => this.close()));
+    }
+
+    async extractClipAtTimestamp(timestamp: string, description: string) {
+        const { video_id } = this.cacheData;
+
+        // Parse timestamp to seconds
+        const parts = timestamp.split(':').map(p => parseInt(p, 10));
+        let startSeconds = 0;
+        if (parts.length === 3) {
+            startSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+        } else if (parts.length === 2) {
+            startSeconds = parts[0] * 60 + parts[1];
+        }
+
+        new Notice(`Extracting 60s clip from ${timestamp}...`);
+
+        try {
+            // Determine output folder (same as source file, in clips subfolder)
+            const parentPath = this.sourceFile.parent?.path || '';
+            const vaultFolder = `${parentPath}/clips`;
+
+            // Create clip name
+            const safeName = `${this.sourceFile.basename}_${timestamp.replace(/:/g, '-')}`;
+
+            // Extract clip
+            const clipPath = await this.plugin.doExtractClip(video_id, startSeconds, 60, safeName, vaultFolder);
+
+            if (!clipPath) {
+                new Notice('Failed to extract clip');
+                return;
+            }
+
+            new Notice(`Clip extracted: ${clipPath}`);
+
+            // Get the canvas and add node
+            const canvasView = this.app.workspace.getActiveViewOfType(ItemView);
+            if (!canvasView || canvasView.getViewType() !== 'canvas') {
+                new Notice('Canvas not active - clip saved but node not added');
+                return;
+            }
+
+            const canvas = (canvasView as any).canvas;
+            if (!canvas) {
+                new Notice('Could not access canvas');
+                return;
+            }
+
+            // Wait a moment for vault to register the new file
+            await new Promise(resolve => setTimeout(resolve, 500));
+
+            // Find the clip file in vault
+            const clipFile = this.app.vault.getAbstractFileByPath(clipPath);
+
+            if (clipFile && clipFile instanceof TFile) {
+                // Create new node to the right of the source node
+                canvas.createFileNode({
+                    file: clipFile,
+                    pos: {
+                        x: this.sourceNode.x + this.sourceNode.width + 50,
+                        y: this.sourceNode.y
+                    },
+                    size: {
+                        width: 320,
+                        height: 240
+                    }
+                });
+
+                canvas.requestSave();
+                new Notice(`Clip node added to canvas at ${timestamp}`);
+            } else {
+                new Notice(`Clip saved but file not found in vault: ${clipPath}`);
+            }
+
+        } catch (error: any) {
+            new Notice(`Error: ${error.message}`);
+            console.error('Extract clip error:', error);
+        }
+    }
+
+    onClose() {
+        this.contentEl.empty();
     }
 }
